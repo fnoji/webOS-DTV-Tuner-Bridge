@@ -1,0 +1,29 @@
+# ---- ビルド成果物 ----
+tv-bridge/*.o
+tv-bridge/webos_tuner_d
+tv-bridge/webos_inject
+tv-bridge/*.so
+tv-bridge/*.so.*
+pc-bondriver/build/
+webos-ipk/.stage/
+webos-ipk/*.ipk
+
+# ---- TV ファームウェア由来（再配布不可） ----
+tv_libs/*
+!tv_libs/README.md
+
+# ---- 検証・解析用 ----
+*.ts
+*.asm
+*.sym
+tvservice_nm.txt
+hal_extract.txt
+kadaptor_*.txt
+
+# ---- 配布物（GitHub Releases に添付。リポジトリには含めない） ----
+release/
+
+# ---- OS ----
+.DS_Store
+Thumbs.db
+desktop.ini

@@ -1,0 +1,20 @@
+[Server]
+; Host=auto で LAN 内の LG webOS TV を自動検出します (固定 IP 指定も可)
+Host=auto
+; 同一 LAN に LG TV が 2 台以上ある場合は、対象 TV の MAC アドレスを指定してください
+; (例: Mac=AA:BB:CC:DD:EE:FF 空欄なら最初に見つかった TV に接続します)
+Mac=
+; 使用するチューナー指定 (auto: 空きチューナーを自動割り当て / 1: 裏チューナー固定 / 0: 表チューナーPVR)
+Tuner=auto
+Port=40580
+; 1: TV 内蔵 B-CAS で復号済み TS を受信 / 0: 生 TS 受信
+DecodeOnTV=1
+; 1: TV 本体のチャンネルスキャン結果を自動取得する
+AutoChannelList=1
+; 1: 同一物理トランスポンダ(TSID)を代表 1 チャンネルにまとめる (TVTest/EDCB推奨)
+UniqueTransponder=1
+ConnectTimeoutMs=2000
+; 1: DLL と同フォルダに BonDriver_WebOS.log を出力する
+Log=1
+; 1: スタンバイ中の TV を検出できない場合に Wake-on-LAN で自動復帰する (接続時 LastMac を自動保存)
+WakeOnLan=1

@@ -1,0 +1,24 @@
+# 既定: テキストは自動判定、バイナリはそのまま
+* text=auto
+
+# シェルスクリプトは LF 固定（TV 上で exec されるため CRLF だと動かない）
+*.sh text eol=lf
+Makefile text eol=lf
+
+# Windows バッチは CRLF
+*.bat text eol=crlf
+
+# C / C++ ソース
+*.c   text eol=lf
+*.h   text eol=lf
+*.cpp text eol=lf
+*.def text eol=lf
+
+# バイナリ
+*.png binary
+*.jpg binary
+*.ipk binary
+*.exe binary
+*.dll binary
+*.lib binary
+*.so  binary

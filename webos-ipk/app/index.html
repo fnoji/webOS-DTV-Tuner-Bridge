@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>webOS DTV Tuner Bridge</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 28px 44px;
+    background: #0b1120; color: #e2e8f0;
+    font-family: "Noto Sans JP", "LG Smart", sans-serif;
+  }
+  h1 { margin: 0 0 6px 0; font-size: 34px; color: #38bdf8; }
+  .hdr-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+  .sub { color: #94a3b8; font-size: 19px; margin: 0; }
+  .dev-pill {
+    background: #1e293b; border: 1px solid #334155; border-radius: 999px;
+    padding: 6px 16px; font-size: 17px; color: #cbd5e1;
+  }
+  .grid { display: flex; gap: 18px; margin-bottom: 16px; }
+  .card {
+    flex: 1; background: #1e293b; border: 2px solid #334155;
+    border-radius: 14px; padding: 16px 20px;
+  }
+  .label { color: #94a3b8; font-size: 17px; margin-bottom: 5px; }
+  .val { font-size: 23px; font-weight: bold; color: #f8fafc; word-break: break-all; }
+  .subval { font-size: 16px; color: #cbd5e1; margin-top: 4px; }
+  .ok { color: #4ade80; }
+  .off { color: #f87171; }
+  .idle { color: #94a3b8; }
+  .btns { display: flex; flex-wrap: wrap; gap: 14px; margin-bottom: 16px; }
+  button {
+    font-size: 20px; font-weight: bold; padding: 12px 22px;
+    border-radius: 10px; border: 3px solid transparent;
+    background: #334155; color: #f8fafc; cursor: pointer;
+    outline: none;
+  }
+  button:focus, button:hover {
+    border-color: #38bdf8; background: #0369a1;
+  }
+  button.primary { background: #15803d; }
+  button.primary:focus, button.primary:hover { background: #16a34a; border-color: #86efac; }
+  button.danger { background: #991b1b; }
+  button.danger:focus, button.danger:hover { background: #dc2626; border-color: #fca5a5; }
+  button.confirming { background: #b45309; border-color: #fde047; }
+  pre {
+    background: #020617; color: #86efac; border: 1px solid #334155;
+    border-radius: 10px; padding: 14px; font-size: 15px; line-height: 1.42;
+    height: 250px; overflow-y: auto; white-space: pre-wrap; margin: 0;
+  }
+  .footer {
+    margin-top: 14px; color: #94a3b8; font-size: 16px;
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  .footer a { color: #38bdf8; text-decoration: none; }
+  .footer a:hover, .footer a:focus { text-decoration: underline; }
+</style>
+</head>
+<body>
+  <h1>webOS DTV Tuner Bridge</h1>
+  <div class="hdr-row">
+    <div class="sub">TV 内蔵 2 チューナー＆B-CAS ネットワーク配信 (BonDriver_WebOS / Mirakurun 互換 API)</div>
+    <div class="dev-pill" id="tv-info">LG webOS TV</div>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <div class="label">サーバー状態</div>
+      <div class="val" id="st-run">確認中...</div>
+      <div class="subval" id="st-auto">自動起動: 確認中...</div>
+      <div class="subval" id="st-pwr">待機モード: 確認中...</div>
+    </div>
+    <div class="card">
+      <div class="label">ネットワーク / 接続先 (BonDriver / Mirakurun)</div>
+      <div class="val" id="st-ip" style="font-size:21px">IP: 確認中...</div>
+      <div class="subval" id="st-net">MAC=- | 送信=0.0 MB</div>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <div class="label">Tuner 1 (Full TS / EXT_INPUT1)</div>
+      <div class="val idle" id="st-t1">待機中</div>
+      <div class="subval" id="st-t1-sub">-</div>
+    </div>
+    <div class="card">
+      <div class="label">Tuner 0 (PVR 動的PID / EXT_INPUT0)</div>
+      <div class="val idle" id="st-t0">待機中</div>
+      <div class="subval" id="st-t0-sub">-</div>
+    </div>
+  </div>
+
+  <div class="btns" id="btn-row">
+    <button class="primary" onclick="runCtl('start')">起動 (Start)</button>
+    <button onclick="runCtl('restart')">再起動 (Restart)</button>
+    <button class="danger" onclick="runCtl('stop')">停止 (Stop)</button>
+    <button id="btn-pw-always" onclick="runCtl('power-always')">ActiveStandby維持</button>
+    <button id="btn-pw-ondemand" onclick="runCtl('power-ondemand')">スリープ</button>
+    <button id="btn-pw-shutdown" onclick="runCtl('power-shutdown')">完全シャットダウン</button>
+    <button onclick="runCtl('enable-autostart')">自動起動 ON</button>
+    <button onclick="runCtl('disable-autostart')">自動起動 OFF</button>
+    <button class="danger" id="btn-uninst" onclick="confirmUninstallPrep()">アンインストール準備</button>
+  </div>
+
+  <div class="label" id="action-msg">操作メッセージ: 待機中</div>
+  <pre id="log-box">読み込み中...</pre>
+  <div class="footer">
+    <span>TCP:40580 (BonDriver) / HTTP:40772 (Mirakurun API・ブラウザ管理)</span>
+    <span>問い合わせ先 (不具合報告): <a href="https://github.com/fnoji" target="_blank" rel="noopener">github.com/fnoji</a></span>
+  </div>
+
+<script>
+(function() {
+  var CTL = '/media/developer/apps/usr/palm/applications/io.github.webostuner.app/native/tunerctl.sh';
+  var uninstTimer = null;
+  var uninstArmed = false;
+
+  function mediaName(m) {
+    if (m === 1) return 'GR';
+    if (m === 4) return 'BS';
+    if (m === 5) return 'CS';
+    return m ? ('M' + m) : '-';
+  }
+
+  function callLuna(uri, payload, cb) {
+    if (typeof PalmServiceBridge === 'undefined') {
+      cb({ returnValue: false, errorText: 'PalmServiceBridge not available' });
+      return;
+    }
+    try {
+      var bridge = new PalmServiceBridge();
+      bridge.onservicecallback = function(msg) {
+        try { cb(JSON.parse(msg)); } catch (e) { cb({ returnValue: false, errorText: String(e) }); }
+      };
+      bridge.call(uri, JSON.stringify(payload || {}));
+    } catch (e) {
+      cb({ returnValue: false, errorText: String(e) });
+    }
+  }
+
+  function httpGet(url, cb) {
+    var xhr = new XMLHttpRequest();
+    xhr.open('GET', url, true);
+    xhr.timeout = 2000;
+    xhr.onreadystatechange = function() {
+      if (xhr.readyState === 4) cb(xhr.status, xhr.responseText);
+    };
+    xhr.onerror = function() { cb(0, ''); };
+    xhr.ontimeout = function() { cb(0, ''); };
+    xhr.send();
+  }
+
+  window.confirmUninstallPrep = function() {
+    var btn = document.getElementById('btn-uninst');
+    if (!uninstArmed) {
+      uninstArmed = true;
+      btn.textContent = '本当に実行？ (再押下で準備実行)';
+      btn.className = 'confirming';
+      document.getElementById('action-msg').textContent = '確認: アンインストール準備を実行するには 5 秒以内にもう一度押してください';
+      clearTimeout(uninstTimer);
+      uninstTimer = setTimeout(function() {
+        uninstArmed = false;
+        btn.textContent = 'アンインストール準備';
+        btn.className = 'danger';
+      }, 5000);
+      return;
+    }
+    clearTimeout(uninstTimer);
+    uninstArmed = false;
+    btn.textContent = 'アンインストール準備';
+    btn.className = 'danger';
+    window.runCtl('uninstall-prep');
+  };
+
+  window.runCtl = function(action) {
+    document.getElementById('action-msg').textContent = '実行中: ' + action + ' ...';
+    callLuna('luna://org.webosbrew.hbchannel.service/exec', {
+      command: 'sh "' + CTL + '" ' + action
+    }, function(res) {
+      if (res && res.returnValue) {
+        document.getElementById('action-msg').textContent = '完了 (' + action + '): ' + (res.stdoutString || '').trim();
+      } else {
+        var err = (res && (res.errorText || res.stderrString)) || '権限エラーまたは未root';
+        document.getElementById('action-msg').textContent = '失敗 (' + action + '): ' + err;
+      }
+      setTimeout(refreshAll, 500);
+    });
+  };
+
+  function updateTunerCard(idVal, idSub, info) {
+    var elVal = document.getElementById(idVal);
+    var elSub = document.getElementById(idSub);
+    if (!info) {
+      elVal.textContent = '-';
+      elVal.className = 'val idle';
+      elSub.textContent = '情報なし';
+      return;
+    }
+    if (info.isUsing) {
+      elVal.textContent = '配信中 (' + mediaName(info.media) + ' phy=' + (info.phy || 0) + ')';
+      elVal.className = 'val ok';
+    } else {
+      elVal.textContent = '待機中';
+      elVal.className = 'val idle';
+    }
+    elSub.textContent = 'clients=' + (info.clients || 0) + ' | freq=' + (info.freq || 0) + 'kHz | lock=' + (info.lock ? 1 : 0);
+  }
+
+  function refreshAll() {
+    var ctlIp = '';
+    callLuna('luna://org.webosbrew.hbchannel.service/exec', {
+      command: 'sh "' + CTL + '" status'
+    }, function(res) {
+      var elAuto = document.getElementById('st-auto');
+      var elRun = document.getElementById('st-run');
+      var elIp = document.getElementById('st-ip');
+      if (res && res.returnValue && res.stdoutString) {
+        try {
+          var st = JSON.parse(res.stdoutString);
+          elAuto.innerHTML = '自動起動 (init.d): <b class="' + (st.autostart ? 'ok' : 'off') + '">' +
+            (st.autostart ? 'ON (有効)' : 'OFF (無効)') + '</b>';
+          var elPwr = document.getElementById('st-pwr');
+          var pm = st.powerMode || 'always';
+          var pmText = pm === 'always' ? 'ActiveStandby維持' : (pm === 'ondemand' ? 'スリープ' : '完全シャットダウン');
+          elPwr.innerHTML = '待機モード: <b class="' + (pm === 'always' ? 'ok' : 'idle') + '">' + pmText + '</b>';
+          document.getElementById('btn-pw-always').className = (pm === 'always') ? 'primary' : '';
+          document.getElementById('btn-pw-ondemand').className = (pm === 'ondemand') ? 'primary' : '';
+          document.getElementById('btn-pw-shutdown').className = (pm === 'shutdown') ? 'primary' : '';
+          if (st.ip) {
+            ctlIp = st.ip;
+            elIp.textContent = 'IP: ' + st.ip + ' (TCP:40580 / HTTP:40772)';
+          }
+          if (!st.running) {
+            elRun.textContent = '停止中';
+            elRun.className = 'val off';
+          }
+        } catch (e) {}
+      }
+    });
+
+    httpGet('http://127.0.0.1:40772/api/status', function(code, body) {
+      var elRun = document.getElementById('st-run');
+      var elIp = document.getElementById('st-ip');
+      var elNet = document.getElementById('st-net');
+      var elPwr = document.getElementById('st-pwr');
+      if (code === 200) {
+        try {
+          var j = JSON.parse(body);
+          elRun.textContent = '稼働中 (TCP:40580 / HTTP:40772)';
+          elRun.className = 'val ok';
+          if (j.modelName) {
+            document.getElementById('tv-info').textContent =
+              (j.deviceName || 'LG webOS TV') + ' (' + j.modelName + ') | webOS ' + (j.webosVersion || '-') + ' | FW ' + (j.firmwareVersion || '-');
+          }
+          if (j.powerMode) {
+            var pm2 = j.powerMode;
+            var pm2Text = pm2 === 'always' ? 'ActiveStandby維持' : (pm2 === 'ondemand' ? 'スリープ' : '完全シャットダウン');
+            elPwr.innerHTML = '待機モード: <b class="' + (pm2 === 'always' ? 'ok' : 'idle') + '">' + pm2Text + '</b>';
+            document.getElementById('btn-pw-always').className = (pm2 === 'always') ? 'primary' : '';
+            document.getElementById('btn-pw-ondemand').className = (pm2 === 'ondemand') ? 'primary' : '';
+            document.getElementById('btn-pw-shutdown').className = (pm2 === 'shutdown') ? 'primary' : '';
+          }
+          var ip = j.ip || ctlIp;
+          if (ip) elIp.textContent = 'IP: ' + ip + ' (TCP:40580 / HTTP:40772)';
+          var mb = ((j.bytes || 0) / (1024 * 1024)).toFixed(1);
+          elNet.textContent = 'MAC=' + (j.mac || '-') + ' | Host=' + (j.host || '-') +
+            ' | 接続数=' + (j.streamCount || 0) + ' | ' + mb + ' MB';
+        } catch (e) {}
+      } else {
+        elNet.textContent = '停止中 (ポート 40580 / 40772 未応答)';
+      }
+    });
+
+    httpGet('http://127.0.0.1:40772/api/tuners', function(code, body) {
+      if (code === 200) {
+        try {
+          var arr = JSON.parse(body);
+          updateTunerCard('st-t1', 'st-t1-sub', arr[0]);
+          updateTunerCard('st-t0', 'st-t0-sub', arr[1]);
+          return;
+        } catch (e) {}
+      }
+      updateTunerCard('st-t1', 'st-t1-sub', null);
+      updateTunerCard('st-t0', 'st-t0-sub', null);
+    });
+
+    httpGet('http://127.0.0.1:40772/api/log', function(code, body) {
+      if (code === 200 && body) {
+        var box = document.getElementById('log-box');
+        box.textContent = body;
+        box.scrollTop = box.scrollHeight;
+      }
+    });
+  }
+
+  // リモコン十字キーでのボタン・リンクフォーカス移動対応
+  document.addEventListener('keydown', function(e) {
+    var btns = Array.prototype.slice.call(document.querySelectorAll('#btn-row button, .footer a'));
+    if (!btns.length) return;
+    var idx = btns.indexOf(document.activeElement);
+    if (idx < 0) idx = 0;
+    if (e.keyCode === 39 || e.keyCode === 40) { // Right / Down
+      btns[(idx + 1) % btns.length].focus();
+      e.preventDefault();
+    } else if (e.keyCode === 37 || e.keyCode === 38) { // Left / Up
+      btns[(idx - 1 + btns.length) % btns.length].focus();
+      e.preventDefault();
+    } else if (e.keyCode === 13) { // Enter/OK
+      if (document.activeElement && document.activeElement.click) {
+        document.activeElement.click();
+      }
+    }
+  });
+
+  window.onload = function() {
+    var first = document.querySelector('#btn-row button');
+    if (first) first.focus();
+    refreshAll();
+    setInterval(refreshAll, 2500);
+  };
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,12 @@
+{
+  "id": "io.github.webostuner.app",
+  "version": "1.0.0",
+  "vendor": "webostuner",
+  "type": "web",
+  "main": "index.html",
+  "title": "webOS DTV Tuner",
+  "icon": "icon80.png",
+  "largeIcon": "icon130.png",
+  "iconColor": "#0f172a",
+  "appDescription": "Dual-Tuner & B-CAS Network Bridge (BonDriver_WebOS / Mirakurun) for rooted webOS TV"
+}
