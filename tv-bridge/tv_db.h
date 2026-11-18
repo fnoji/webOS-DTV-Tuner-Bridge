@@ -17,6 +17,8 @@ typedef struct {
     uint16_t onid;
     uint16_t sid;
     uint16_t service_type;
+    int      remote_key;       /* リモコンキーID (GR: 1..12, その他: 0) */
+    uint8_t  is_sub;           /* サブチャンネル判定 (1=サブ, 0=メイン) */
     uint8_t  skipped;
     uint8_t  invisible;
     char     ch_num[16];
@@ -44,7 +46,7 @@ char *tv_db_build_services_json(const tv_channel_list_t *list);
 char *tv_db_build_service_json_one(const tv_channel_t *c);
 
 /**
- * TV 純正 EPG DB (com.webos.epgdb) から番組表を取得し、Mirakurun /api/programs JSON を生成する。
+ * TV 純正 EPG DB (com.webos.epgdb) + EIT から番組表を取得し、Mirakurun /api/programs JSON を生成する。
  * filter_sid != 0 の場合は該当サービス (16bit serviceId または Mirakurun ServiceItemId) のみ返す（要 free）。
  */
 char *tv_db_get_programs_json(uint64_t filter_sid, int force_refresh);
@@ -55,8 +57,14 @@ char *tv_db_get_program_by_id_json(uint64_t program_id);
 /** EPG DB を再スキャンしてキャッシュを更新し、新規/変更番組数を返す（差分はイベントキューへ積まれる） */
 int tv_db_poll_epg_changes(void);
 
+/** EIT 収集済みの番組表から前回との差分 (create/update/remove) を検出してイベントキューへ積む */
+int tv_db_sync_eit_events(void);
+
 /** 現在のイベントシーケンス番号を取得する */
 uint64_t tv_db_get_event_seq(void);
+
+/** 直近の EPG DB 応答 (1 ページ目の生テキスト) を取得する (デバッグ用) */
+const char *tv_db_get_epg_raw_sample(void);
 
 /**
  * cursor_seq_io 以降の未読イベント JSON 群を取り出す（無ければ NULL、要 free）。

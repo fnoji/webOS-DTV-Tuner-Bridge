@@ -150,6 +150,18 @@ void b25_reset_stream(b25_ctx_t *ctx) {
     memset(ctx->pmt_ver, 0xff, sizeof(ctx->pmt_ver));
 }
 
+static uint32_t mpeg2_crc32(const uint8_t *data, size_t len) {
+    uint32_t crc = 0xffffffffu;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= (uint32_t)data[i] << 24;
+        for (int b = 0; b < 8; b++) {
+            if (crc & 0x80000000u) crc = (crc << 1) ^ 0x04c11db7u;
+            else crc <<= 1;
+        }
+    }
+    return crc;
+}
+
 static b25_service_t *get_or_add_service(b25_ctx_t *ctx, uint16_t sid, uint16_t pmt_pid) {
     for (int i = 0; i < ctx->num_services; i++) {
         if (ctx->services[i].sid == sid) {
@@ -162,13 +174,16 @@ static b25_service_t *get_or_add_service(b25_ctx_t *ctx, uint16_t sid, uint16_t 
     memset(s, 0, sizeof(*s));
     s->sid = sid;
     s->pmt_pid = pmt_pid;
+    s->pmt_ver = 0xff;
     return s;
 }
 
 static void parse_pat(b25_ctx_t *ctx, const uint8_t *sec, size_t max_len) {
     if (max_len < 12 || sec[0] != 0x00) return;
+    if ((sec[5] & 0x01u) == 0) return; /* current_next_indicator == 0 */
     uint16_t slen = ((uint16_t)(sec[1] & 0x0fu) << 8) | sec[2];
     if ((size_t)(3 + slen) > max_len || slen < 9) return;
+    if (mpeg2_crc32(sec, 3 + (size_t)slen) != 0) return;
     ctx->pat_tsid = ((uint16_t)sec[3] << 8) | sec[4];
     ctx->pat_ver  = (sec[5] >> 1) & 0x1fu;
     size_t end = 3 + (size_t)slen - 4;
@@ -187,8 +202,10 @@ static void parse_pat(b25_ctx_t *ctx, const uint8_t *sec, size_t max_len) {
 
 static void parse_cat(b25_ctx_t *ctx, const uint8_t *sec, size_t max_len) {
     if (max_len < 12 || sec[0] != 0x01 || !ctx->pid_cb) return;
+    if ((sec[5] & 0x01u) == 0) return;
     uint16_t slen = ((uint16_t)(sec[1] & 0x0fu) << 8) | sec[2];
     if ((size_t)(3 + slen) > max_len || slen < 9) return;
+    if (mpeg2_crc32(sec, 3 + (size_t)slen) != 0) return;
     size_t end = 3 + (size_t)slen - 4;
     size_t p = 8;
     while (p + 2 <= end) {
@@ -224,13 +241,16 @@ static uint16_t find_ca_ecm_pid(const uint8_t *desc, size_t len) {
 
 static void parse_pmt(b25_ctx_t *ctx, uint16_t pmt_pid, const uint8_t *sec, size_t max_len) {
     if (max_len < 16 || sec[0] != 0x02) return;
+    if ((sec[5] & 0x01u) == 0) return; /* current_next_indicator == 0 */
+    uint16_t slen = ((uint16_t)(sec[1] & 0x0fu) << 8) | sec[2];
+    if ((size_t)(3 + slen) > max_len || slen < 13) return;
+    if (mpeg2_crc32(sec, 3 + (size_t)slen) != 0) return;
+
     uint16_t prog = ((uint16_t)sec[3] << 8) | sec[4];
     uint8_t ver = (sec[5] >> 1) & 0x1fu;
     b25_service_t *svc = get_or_add_service(ctx, prog, pmt_pid);
-    if (ctx->pmt_ver[pmt_pid] == ver && (!svc || svc->has_pmt)) return;
+    if (svc && svc->has_pmt && svc->pmt_ver == ver) return;
 
-    uint16_t slen = ((uint16_t)(sec[1] & 0x0fu) << 8) | sec[2];
-    if ((size_t)(3 + slen) > max_len || slen < 13) return;
     size_t end = 3 + (size_t)slen - 4;
 
     uint16_t pcr_pid = (((uint16_t)sec[8] & 0x1fu) << 8) | sec[9];
@@ -281,11 +301,16 @@ static void parse_pmt(b25_ctx_t *ctx, uint16_t pmt_pid, const uint8_t *sec, size
                 ctx->pid_cb(ctx->pid_user, es_pid, 1); /* Audio */
             } else if (stype == 0x06) {
                 ctx->pid_cb(ctx->pid_user, es_pid, 4); /* 字幕・文字スーパー */
+            } else if (stype == 0x0b || stype == 0x0c || stype == 0x0d) {
+                ctx->pid_cb(ctx->pid_user, es_pid, 5); /* DSM-CC データ放送カルーセル・イベントメッセージ */
             }
         }
         pos += es_ilen;
     }
-    if (svc) svc->has_pmt = 1;
+    if (svc) {
+        svc->has_pmt = 1;
+        svc->pmt_ver = ver;
+    }
     ctx->pmt_ver[pmt_pid] = ver;
 }
 
@@ -421,13 +446,19 @@ static void process_packets_internal(b25_ctx_t *ctx, uint8_t *ts_buf, size_t num
         }
 
         /* スクランブルされた ES の MULTI2 復号 */
-        if (do_decrypt && (tsc == 2 || tsc == 3) && ctx->has_syskey && (afc == 1 || afc == 3)) {
+        if (do_decrypt && (tsc == 2 || tsc == 3) && (afc == 1 || afc == 3)) {
             int eidx = (int)ctx->pid_to_ecm[pid] - 1;
             if (eidx < 0 && ctx->num_ecms > 0) eidx = 0;
-            if (eidx >= 0 && ctx->ecms[eidx].valid) {
+            if (eidx >= 0 && ctx->ecms[eidx].valid && ctx->has_syskey) {
                 const uint32_t *wk = (tsc == 3) ? ctx->ecms[eidx].wk_odd : ctx->ecms[eidx].wk_even;
                 decrypt_cbc_ofb(p + off, 188 - off, ctx->iv_l, ctx->iv_r, wk);
                 p[3] &= 0x3fu;
+            } else {
+                /* 初回 ECM 鍵取得前のスクランブルパケットは NULL パケット (0x1FFF) 化し、
+                   psisiarc (データ放送抽出) 等が未復号データを読み込んで破損するのを防止 */
+                p[1] = 0x1fu;
+                p[2] = 0xffu;
+                p[3] = 0x10u;
             }
         }
     }
@@ -439,18 +470,6 @@ void b25_process_packets(b25_ctx_t *ctx, uint8_t *ts_buf, size_t num_packets) {
 
 void b25_scan_sections(b25_ctx_t *ctx, const uint8_t *ts_buf, size_t num_packets) {
     process_packets_internal(ctx, (uint8_t *)ts_buf, num_packets, 0);
-}
-
-static uint32_t mpeg2_crc32(const uint8_t *data, size_t len) {
-    uint32_t crc = 0xffffffffu;
-    for (size_t i = 0; i < len; i++) {
-        crc ^= (uint32_t)data[i] << 24;
-        for (int b = 0; b < 8; b++) {
-            if (crc & 0x80000000u) crc = (crc << 1) ^ 0x04c11db7u;
-            else crc <<= 1;
-        }
-    }
-    return crc;
 }
 
 static void build_single_service_pat_pkt(uint8_t *pkt, uint16_t tsid, uint8_t ver,
@@ -495,8 +514,8 @@ static void build_single_service_pat_pkt(uint8_t *pkt, uint16_t tsid, uint8_t ve
 
 static int is_common_psi_si_pid(uint16_t pid) {
     return (pid == 0x0001 || pid == 0x0010 || pid == 0x0011 || pid == 0x0012 ||
-            pid == 0x0014 || pid == 0x0023 || pid == 0x0024 || pid == 0x0026 ||
-            pid == 0x0027 || pid == 0x0028 || pid == 0x0029);
+            pid == 0x0014 || pid == 0x001f || pid == 0x0023 || pid == 0x0024 ||
+            pid == 0x0026 || pid == 0x0027 || pid == 0x0028 || pid == 0x0029);
 }
 
 size_t b25_filter_service_packets(const b25_ctx_t *ctx, const uint8_t *in_ts, size_t num_packets,

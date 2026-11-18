@@ -2,6 +2,7 @@
  * tv_db.c: LG webOS 純正 DB8 (チャンネル一覧) & EPGDB (番組表) の軽量 JSON パーサ＆変換実装
  */
 #include "tv_db.h"
+#include "eit.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -100,7 +101,57 @@ static int hex4(const char *p, unsigned *out) {
     return 1;
 }
 
-/** JSON 文字列リテラル ("...") を UTF-8 へデコードして読み込み、終了位置の次のポインタを返す */
+/* LG webOS EPG DB が使用する PUA (U+E0F8..U+E0FF, U+E180..U+E19C) -> ARIB 94区囲み文字テーブル */
+static const char * const LG_PUA_ROW94[38] = {
+    NULL,
+    "[HV]", "[SD]", "[P]", "[W]", "[MV]", "[手]", "[字]", "[双]",
+    "[デ]", "[S]", "[二]", "[多]", "[解]", "[SS]", "[B]", "[N]",
+    "■", "●", "[天]", "[交]", "[映]", "[無]", "[料]", "[年齢制限]",
+    "[前]", "[後]", "[再]", "[新]", "[初]", "[終]", "[生]", "[販]",
+    "[声]", "[吹]", "[PPV]", "(秘)", "[ほか]"
+};
+
+static const char *map_lg_pua_codepoint(unsigned cp) {
+    if (cp >= 0xE0F8u && cp <= 0xE0FFu) {
+        return LG_PUA_ROW94[cp - 0xE0F8u + 1u];
+    }
+    if (cp >= 0xE180u && cp <= 0xE19Cu) {
+        return LG_PUA_ROW94[cp - 0xE180u + 9u];
+    }
+    if (cp == 0xE2F0u) return "!?";
+    if (cp == 0xE2F1u) return "!!";
+    return NULL;
+}
+
+static void append_codepoint_filtered(char *out, size_t out_sz, size_t *w, unsigned cp) {
+    if (cp >= 0xE000u && cp <= 0xF8FFu) {
+        const char *rep = map_lg_pua_codepoint(cp);
+        if (rep) {
+            size_t rl = strlen(rep);
+            if (*w + rl < out_sz) {
+                memcpy(out + *w, rep, rl);
+                *w += rl;
+            }
+        }
+        return;
+    }
+    if (cp < 0x80u) {
+        if (*w + 1 < out_sz) out[(*w)++] = (char)cp;
+    } else if (cp < 0x800u) {
+        if (*w + 2 < out_sz) {
+            out[(*w)++] = (char)(0xC0u | (cp >> 6));
+            out[(*w)++] = (char)(0x80u | (cp & 0x3Fu));
+        }
+    } else {
+        if (*w + 3 < out_sz) {
+            out[(*w)++] = (char)(0xE0u | (cp >> 12));
+            out[(*w)++] = (char)(0x80u | ((cp >> 6) & 0x3Fu));
+            out[(*w)++] = (char)(0x80u | (cp & 0x3Fu));
+        }
+    }
+}
+
+/** JSON 文字列リテラル ("...") を UTF-8 へデコードして読み込み (LG PUA 外字変換付き)、終了位置の次のポインタを返す */
 static const char *parse_json_str(const char *p, char *out, size_t out_sz) {
     p = skip_ws(p);
     if (*p != '"') return NULL;
@@ -122,22 +173,17 @@ static const char *parse_json_str(const char *p, char *out, size_t out_sz) {
                 unsigned cp = 0;
                 if (hex4(p, &cp)) {
                     p += 4;
-                    if (cp < 0x80) {
-                        if (w + 1 < out_sz) out[w++] = (char)cp;
-                    } else if (cp < 0x800) {
-                        if (w + 2 < out_sz) {
-                            out[w++] = (char)(0xc0 | (cp >> 6));
-                            out[w++] = (char)(0x80 | (cp & 0x3f));
-                        }
-                    } else {
-                        if (w + 3 < out_sz) {
-                            out[w++] = (char)(0xe0 | (cp >> 12));
-                            out[w++] = (char)(0x80 | ((cp >> 6) & 0x3f));
-                            out[w++] = (char)(0x80 | (cp & 0x3f));
-                        }
-                    }
+                    append_codepoint_filtered(out, out_sz, &w, cp);
                 }
             }
+        } else if (c >= 0xE0u && c <= 0xEFu &&
+                   ((unsigned char)p[0] & 0xC0u) == 0x80u &&
+                   ((unsigned char)p[1] & 0xC0u) == 0x80u) {
+            unsigned b1 = (unsigned char)p[0];
+            unsigned b2 = (unsigned char)p[1];
+            unsigned cp = ((c & 0x0Fu) << 12) | ((b1 & 0x3Fu) << 6) | (b2 & 0x3Fu);
+            p += 2;
+            append_codepoint_filtered(out, out_sz, &w, cp);
         } else {
             if (w + 1 < out_sz) out[w++] = (char)c;
         }
@@ -187,14 +233,35 @@ static int parse_json_int(const char *p, long long *val_out, const char **next_o
     return 1;
 }
 
+static int is_dummy_channel_name(const char *name) {
+    if (!name) return 1;
+    while (*name == ' ' || *name == '\t') name++;
+    if (*name == '\0') return 1;
+    if (strcmp(name, "-") == 0 ||
+        strcmp(name, "−") == 0 || /* U+2212 */
+        strcmp(name, "ー") == 0 || /* U+30FC */
+        strcmp(name, "―") == 0 || /* U+2015 */
+        strcmp(name, "－") == 0) { /* U+FF0D */
+        return 1;
+    }
+    return 0;
+}
+
 static int cmp_channel(const void *a, const void *b) {
     const tv_channel_t *ca = (const tv_channel_t *)a;
     const tv_channel_t *cb = (const tv_channel_t *)b;
     if (ca->space != cb->space) return ca->space - cb->space;
+    /* 地デジはリモコン番号順 -> ONID順 -> サービスID順 (011 -> 012 -> 013) */
+    if (ca->media == 1) {
+        int rka = ca->remote_key > 0 ? ca->remote_key : 99;
+        int rkb = cb->remote_key > 0 ? cb->remote_key : 99;
+        if (rka != rkb) return rka - rkb;
+        if (ca->onid != cb->onid) return (int)ca->onid - (int)cb->onid;
+    }
+    if (ca->sid != cb->sid) return (int)ca->sid - (int)cb->sid;
     int na = atoi(ca->ch_num), nb = atoi(cb->ch_num);
     if (na != nb) return na - nb;
-    if (ca->phy != cb->phy) return (ca->phy < cb->phy) ? -1 : 1;
-    return (int)ca->sid - (int)cb->sid;
+    return (ca->phy < cb->phy) ? -1 : (ca->phy > cb->phy ? 1 : 0);
 }
 
 int tv_db_load_channels(tv_channel_list_t *list) {
@@ -225,8 +292,10 @@ int tv_db_load_channels(tv_channel_list_t *list) {
         tv_channel_t ch;
         memset(&ch, 0, sizeof(ch));
         int mode_id = -1;
+        int shortcut = 255;
+        int special_svc = 0;
         long long num_val = 0;
-        char key[64], sval[256];
+        char key[64];
 
         while (*rp) {
             rp = skip_ws(rp);
@@ -252,6 +321,8 @@ int tv_db_load_channels(tv_channel_list_t *list) {
                 ch.sid = (uint16_t)num_val; rp = np;
             } else if (strcmp(key, "serviceType") == 0 && parse_json_int(rp, &num_val, &np)) {
                 ch.service_type = (uint16_t)num_val; rp = np;
+            } else if (strcmp(key, "shortCut") == 0 && parse_json_int(rp, &num_val, &np)) {
+                shortcut = (int)num_val; rp = np;
             } else if (strcmp(key, "channelNumber") == 0 && *rp == '"') {
                 rp = parse_json_str(rp, ch.ch_num, sizeof(ch.ch_num));
             } else if (strcmp(key, "channelName") == 0 && *rp == '"') {
@@ -264,16 +335,30 @@ int tv_db_load_channels(tv_channel_list_t *list) {
             } else if (strcmp(key, "Invisible") == 0) {
                 ch.invisible = (strncmp(rp, "true", 4) == 0) ? 1 : 0;
                 rp = skip_json_val(rp);
+            } else if (strcmp(key, "specialService") == 0) {
+                special_svc = (strncmp(rp, "true", 4) == 0) ? 1 : 0;
+                rp = skip_json_val(rp);
             } else {
-                (void)sval;
                 rp = skip_json_val(rp);
             }
             if (!rp) break;
         }
 
-        if (ch.freq_khz > 0 && ch.sid > 0 && !ch.skipped && !ch.invisible && ch.service_type != 164) {
+        /* デジタルTV (1) またはデジタル音声 (2: 放送大学ラジオ等) のみ対象とし、
+           臨時サービス (161 / specialService)、データ放送 (192)、エンジニアリング (164)、
+           プロモーション (165)、旧BSプレミアム跡地 (BS 103)、ダミー局名 ("−") を除外 */
+        if (ch.freq_khz > 0 && ch.sid > 0 && !ch.skipped && !ch.invisible &&
+            (ch.service_type == 1 || ch.service_type == 2) && !special_svc &&
+            !(ch.onid == 4 && ch.sid == 103) &&
+            !is_dummy_channel_name(ch.name)) {
             if (mode_id == 0) {
                 ch.media = 1; ch.space = 0; snprintf(ch.type_str, sizeof(ch.type_str), "GR");
+                if (shortcut >= 1 && shortcut <= 12) {
+                    ch.remote_key = shortcut;
+                } else {
+                    int cn = atoi(ch.ch_num);
+                    if (cn >= 11 && cn <= 129) ch.remote_key = cn / 10;
+                }
             } else if (mode_id == 4) {
                 ch.media = 4; ch.space = 1; snprintf(ch.type_str, sizeof(ch.type_str), "BS");
             } else if (mode_id == 5 || mode_id == 6) {
@@ -292,6 +377,38 @@ int tv_db_load_channels(tv_channel_list_t *list) {
         }
     }
     free(raw);
+
+    /* 同一 (media, onid, tsid) 内で最小 SID (プライマリサービス) とリモコン番号を特定し、サブチャンネル判定を設定 */
+    eit_clear_services();
+    for (int i = 0; i < list->count; i++) {
+        tv_channel_t *c = &list->items[i];
+        uint16_t min_sid = c->sid;
+        int rkey = c->remote_key;
+        for (int j = 0; j < list->count; j++) {
+            const tv_channel_t *o = &list->items[j];
+            if (o->media == c->media && o->onid == c->onid && o->tsid == c->tsid) {
+                if (o->sid < min_sid) min_sid = o->sid;
+                if (rkey == 0 && o->remote_key > 0) rkey = o->remote_key;
+            }
+        }
+        if (c->media == 1 && c->remote_key == 0 && rkey > 0) {
+            c->remote_key = rkey;
+        }
+        if (c->media == 1) {
+            /* 地デジ: ARIB TR-B14 のビットマスク (sid & 0x0187) または同一 TS 内の 2 番目以降をサブチャンネルと判定 */
+            c->is_sub = ((c->sid & 0x0187) != 0 || c->sid > min_sid) ? 1 : 0;
+            eit_register_service(c->onid, c->tsid, c->sid, min_sid);
+        } else if (c->media == 4) {
+            /* BS: 同一 (onid, tsid) 内の最小 SID (101, 141, 151, 161, 171, 181, 231 等) をメイン、それ以外をサブと判定 */
+            c->is_sub = (c->sid > min_sid) ? 1 : 0;
+            eit_register_service(c->onid, c->tsid, c->sid, min_sid);
+        } else {
+            /* CS: 1 トランスポンダに複数の独立チャンネルが相乗りするため全局をメイン扱い */
+            c->is_sub = 0;
+            eit_register_service(c->onid, c->tsid, c->sid, c->sid);
+        }
+    }
+
     if (list->count > 1) qsort(list->items, (size_t)list->count, sizeof(tv_channel_t), cmp_channel);
     return 0;
 }
@@ -329,13 +446,22 @@ const tv_channel_t *tv_db_find_by_sid(const tv_channel_list_t *list, uint64_t mi
 }
 
 static void sb_append_service_obj(strbuf_t *sb, const tv_channel_t *c) {
-    char head[320];
-    snprintf(head, sizeof(head),
-             "{\"id\":%llu,\"serviceId\":%u,\"networkId\":%u,\"type\":%u,"
-             "\"hasLogoData\":false,\"epgReady\":true,"
-             "\"channel\":{\"type\":\"%s\",\"channel\":\"%u\"},\"name\":",
-             (unsigned long long)c->mirakurun_sid, c->sid, c->onid, c->service_type ? c->service_type : 1,
-             c->type_str, c->phy);
+    char head[384];
+    if (c->remote_key > 0) {
+        snprintf(head, sizeof(head),
+                 "{\"id\":%llu,\"serviceId\":%u,\"networkId\":%u,\"type\":%u,"
+                 "\"remoteControlKeyId\":%d,\"hasLogoData\":false,\"epgReady\":true,"
+                 "\"channel\":{\"type\":\"%s\",\"channel\":\"%u\"},\"name\":",
+                 (unsigned long long)c->mirakurun_sid, c->sid, c->onid, c->service_type ? c->service_type : 1,
+                 c->remote_key, c->type_str, c->phy);
+    } else {
+        snprintf(head, sizeof(head),
+                 "{\"id\":%llu,\"serviceId\":%u,\"networkId\":%u,\"type\":%u,"
+                 "\"hasLogoData\":false,\"epgReady\":true,"
+                 "\"channel\":{\"type\":\"%s\",\"channel\":\"%u\"},\"name\":",
+                 (unsigned long long)c->mirakurun_sid, c->sid, c->onid, c->service_type ? c->service_type : 1,
+                 c->type_str, c->phy);
+    }
     sb_append(sb, head);
     sb_append_json_str(sb, c->name);
     sb_append(sb, "}");
@@ -353,8 +479,10 @@ char *tv_db_build_services_json(const tv_channel_list_t *list) {
     strbuf_t sb;
     sb_init(&sb, 32768);
     sb_append(&sb, "[");
+    int first = 1;
     for (int i = 0; i < list->count; i++) {
-        if (i > 0) sb_append(&sb, ",");
+        if (!first) sb_append(&sb, ",");
+        first = 0;
         sb_append_service_obj(&sb, &list->items[i]);
     }
     sb_append(&sb, "]");
@@ -366,7 +494,7 @@ char *tv_db_build_channels_json(const tv_channel_list_t *list) {
     sb_init(&sb, 32768);
     sb_append(&sb, "[");
     int first_ch = 1;
-    /* 同一 (media, phy, tsid) ごとにグルーピング */
+    /* 同一 (media, phy, tsid) ごとにグルーピング (Mirakurun 準拠) */
     uint8_t *done = (uint8_t *)calloc((size_t)(list->count + 1), 1);
     for (int i = 0; i < list->count; i++) {
         if (done[i]) continue;
@@ -405,7 +533,7 @@ char *tv_db_build_channels_json(const tv_channel_list_t *list) {
 }
 
 /* ---- EPG キャッシュ＆差分イベント配信 ---- */
-#define EPG_EVENT_RING_CAP 1024
+#define EPG_EVENT_RING_CAP 8192
 
 typedef struct {
     uint64_t id;
@@ -417,10 +545,9 @@ typedef struct {
     char    *json;
 } epg_event_item_t;
 
-static pthread_mutex_t  g_fetch_mtx = PTHREAD_MUTEX_INITIALIZER; /* EPG DB 取得専用（長時間ロック可） */
-static pthread_mutex_t  g_epg_mtx   = PTHREAD_MUTEX_INITIALIZER; /* キャッシュポインタ差し替え専用（瞬間ロック） */
-static char            *g_epg_cache_json = NULL;
-static time_t           g_epg_cache_ts   = 0;
+static pthread_mutex_t  g_fetch_mtx = PTHREAD_MUTEX_INITIALIZER;
+static char             g_epg_raw_sample[8192];
+static int              g_epgdb_polled_once = 0;
 
 static epg_hash_entry_t *g_prev_hashes   = NULL; /* g_fetch_mtx 配下で管理 */
 static size_t            g_prev_hash_cnt = 0;
@@ -532,17 +659,122 @@ static int64_t parse_webos_time_ms(const char *s) {
     return (int64_t)tt * 1000LL;
 }
 
-static int fetch_and_build_epg_json(void) {
-    strbuf_t out;
-    sb_init(&out, 262144);
-    sb_append(&out, "[");
-    int first = 1;
+/**
+ * EIT + フォールバック統合後の番組表 JSON を前回ハッシュと比較し、
+ * 新規/更新/削除イベントを /api/events/stream のリングバッファへ積む (要 g_fetch_mtx 保持)
+ */
+static int sync_eit_events_locked(void) {
+    char *json = eit_build_programs_json(0);
+    if (!json) return 0;
 
     size_t h_cap = 8192, h_cnt = 0;
     epg_hash_entry_t *new_hashes = (epg_hash_entry_t *)malloc(h_cap * sizeof(epg_hash_entry_t));
     int changed_count = 0;
     int64_t now_ms = (int64_t)time(NULL) * 1000LL;
 
+    const char *p = json;
+    while (*p && *p != '[') p++;
+    if (*p == '[') p++;
+
+    while (*p) {
+        p = skip_ws(p);
+        if (*p == ']' || *p == '\0') break;
+        if (*p == ',') { p++; continue; }
+        if (*p != '{') break;
+
+        const char *obj_start = p;
+        int depth = 0, in_str = 0, esc = 0;
+        while (*p) {
+            char c = *p++;
+            if (in_str) {
+                if (esc) esc = 0;
+                else if (c == '\\') esc = 1;
+                else if (c == '"') in_str = 0;
+            } else {
+                if (c == '"') in_str = 1;
+                else if (c == '{') depth++;
+                else if (c == '}') {
+                    depth--;
+                    if (depth == 0) break;
+                }
+            }
+        }
+        size_t obj_len = (size_t)(p - obj_start);
+        unsigned long long mir_pid = 0;
+        if (sscanf(obj_start, "{\"id\":%llu,", &mir_pid) == 1 && mir_pid > 0) {
+            uint64_t h = fnv1a_update(14695981039346656037ULL, obj_start, obj_len);
+            if (new_hashes) {
+                if (h_cnt >= h_cap) {
+                    size_t ncap = h_cap * 2;
+                    epg_hash_entry_t *nh = (epg_hash_entry_t *)realloc(new_hashes, ncap * sizeof(epg_hash_entry_t));
+                    if (nh) { new_hashes = nh; h_cap = ncap; }
+                }
+                if (h_cnt < h_cap) {
+                    new_hashes[h_cnt].id   = (uint64_t)mir_pid;
+                    new_hashes[h_cnt].hash = h;
+                    h_cnt++;
+                }
+            }
+            if (g_prev_hashes) {
+                epg_hash_entry_t key_entry = { (uint64_t)mir_pid, 0 };
+                epg_hash_entry_t *found = (epg_hash_entry_t *)bsearch(
+                    &key_entry, g_prev_hashes, g_prev_hash_cnt, sizeof(epg_hash_entry_t), cmp_hash_entry);
+                if (!found) {
+                    push_epg_event("create", obj_start, obj_len, now_ms);
+                    changed_count++;
+                } else if (found->hash != h) {
+                    push_epg_event("update", obj_start, obj_len, now_ms);
+                    changed_count++;
+                }
+            }
+        }
+    }
+    free(json);
+
+    if (new_hashes && h_cnt > 0) {
+        qsort(new_hashes, h_cnt, sizeof(epg_hash_entry_t), cmp_hash_entry);
+        /* 重複 ID があれば圧縮 */
+        size_t uw = 0;
+        for (size_t i = 0; i < h_cnt; i++) {
+            if (uw > 0 && new_hashes[uw - 1].id == new_hashes[i].id) {
+                new_hashes[uw - 1].hash = new_hashes[i].hash;
+            } else {
+                new_hashes[uw++] = new_hashes[i];
+            }
+        }
+        h_cnt = uw;
+
+        if (g_prev_hashes && g_prev_hash_cnt > 0) {
+            size_t pi = 0, ni = 0;
+            int rem_cnt = 0;
+            while (pi < g_prev_hash_cnt && rem_cnt < 1024) {
+                if (ni >= h_cnt || g_prev_hashes[pi].id < new_hashes[ni].id) {
+                    push_epg_remove_event(g_prev_hashes[pi].id, now_ms);
+                    changed_count++;
+                    rem_cnt++;
+                    pi++;
+                } else if (g_prev_hashes[pi].id == new_hashes[ni].id) {
+                    pi++;
+                    ni++;
+                } else {
+                    ni++;
+                }
+            }
+        }
+        free(g_prev_hashes);
+        g_prev_hashes   = new_hashes;
+        g_prev_hash_cnt = h_cnt;
+    } else {
+        free(new_hashes);
+    }
+
+    return changed_count;
+}
+
+/**
+ * LG 純正 EPG DB (com.webos.epgdb) からプライマリ番組のみをフォールバック登録する (要 g_fetch_mtx 保持)
+ */
+static void poll_webos_epgdb_locked(void) {
     char next_tok[256] = {0};
     for (int page = 0; page < 40; page++) {
         char cmd[1024];
@@ -550,19 +782,25 @@ static int fetch_and_build_epg_json(void) {
             snprintf(cmd, sizeof(cmd),
                      "luna-send -n 1 -w 4000 luna://com.webos.epgdb/find "
                      "'{\"query\":{\"from\":\"com.webos.service.tv.programSCH:4\","
-                     "\"select\":[\"programId\",\"startTime\",\"duration\",\"programName\",\"description\",\"genre\",\"genreList\"],"
+                     "\"select\":[\"programId\",\"startTime\",\"duration\",\"programName\",\"description\",\"genre\",\"genreList\",\"additionalInfo\"],"
                      "\"limit\":250,\"page\":\"%s\"}}' </dev/null",
                      next_tok);
         } else {
             snprintf(cmd, sizeof(cmd),
                      "luna-send -n 1 -w 4000 luna://com.webos.epgdb/find "
                      "'{\"query\":{\"from\":\"com.webos.service.tv.programSCH:4\","
-                     "\"select\":[\"programId\",\"startTime\",\"duration\",\"programName\",\"description\",\"genre\",\"genreList\"],"
+                     "\"select\":[\"programId\",\"startTime\",\"duration\",\"programName\",\"description\",\"genre\",\"genreList\",\"additionalInfo\"],"
                      "\"limit\":250}}' </dev/null");
         }
         size_t rlen = 0;
         char *raw = run_cmd_capture(cmd, &rlen);
         if (!raw || rlen == 0) { free(raw); break; }
+
+        if (page == 0) {
+            size_t n = rlen < (sizeof(g_epg_raw_sample) - 1) ? rlen : (sizeof(g_epg_raw_sample) - 1);
+            memcpy(g_epg_raw_sample, raw, n);
+            g_epg_raw_sample[n] = '\0';
+        }
 
         char new_next[256] = {0};
         const char *np_key = strstr(raw, "\"next\"");
@@ -586,6 +824,8 @@ static int fetch_and_build_epg_json(void) {
             char pname[256] = {0}, pdesc[1024] = {0};
             long long dur_sec = 0;
             int genre_lv1 = -1;
+            int genre_lv2 = 15;
+            int is_primary = 1;
             char key[64];
 
             while (*rp) {
@@ -611,71 +851,41 @@ static int fetch_and_build_epg_json(void) {
                     dur_sec = nv; rp = nx;
                 } else if (strcmp(key, "genre") == 0 && parse_json_int(rp, &nv, &nx)) {
                     genre_lv1 = (int)nv; rp = nx;
+                } else if (strcmp(key, "genreList") == 0 && *rp == '[') {
+                    const char *gend = skip_json_val(rp);
+                    if (parse_json_int(rp + 1, &nv, NULL)) {
+                        genre_lv2 = (int)nv;
+                    }
+                    rp = gend;
+                } else if (strcmp(key, "additionalInfo") == 0 && *rp == '{') {
+                    const char *aend = skip_json_val(rp);
+                    if (aend) {
+                        const char *ip = strstr(rp, "\"isPrimary\"");
+                        if (ip && ip < aend) {
+                            const char *c = strchr(ip, ':');
+                            if (c && c < aend) {
+                                c = skip_ws(c + 1);
+                                if (strncmp(c, "false", 5) == 0) is_primary = 0;
+                            }
+                        }
+                    }
+                    rp = aend;
                 } else {
                     rp = skip_json_val(rp);
                 }
                 if (!rp) break;
             }
 
+            /* isPrimary: false のサブチャンネル共有複製レコードは取り込まない */
+            if (!is_primary) continue;
+
             unsigned onid = 0, tsid = 0, sid = 0, evid = 0;
             if (sscanf(pid_str, "%u_%u_%u_%u", &onid, &tsid, &sid, &evid) == 4 && pname[0]) {
                 int64_t start_ms = parse_webos_time_ms(stime_str);
                 if (start_ms > 0 && dur_sec > 0) {
-                    uint64_t mir_sid = (uint64_t)onid * 100000ULL + (uint64_t)sid;
-                    uint64_t mir_pid = mir_sid * 100000ULL + (uint64_t)evid;
-                    if (!first) sb_append(&out, ",");
-                    first = 0;
-
-                    size_t obj_pos = out.len;
-                    char hdr[256];
-                    snprintf(hdr, sizeof(hdr),
-                             "{\"id\":%llu,\"eventId\":%u,\"serviceId\":%u,\"networkId\":%u,"
-                             "\"startAt\":%lld,\"duration\":%lld,\"isFree\":true,\"name\":",
-                             (unsigned long long)mir_pid, evid, sid, onid,
-                             (long long)start_ms, dur_sec * 1000LL);
-                    sb_append(&out, hdr);
-                    sb_append_json_str(&out, pname);
-                    sb_append(&out, ",\"description\":");
-                    sb_append_json_str(&out, pdesc);
-                    if (genre_lv1 >= 0) {
-                        char gbuf[48];
-                        snprintf(gbuf, sizeof(gbuf), ",\"genres\":[{\"lv1\":%d,\"lv2\":15}]", genre_lv1);
-                        sb_append(&out, gbuf);
-                    }
-                    sb_append(&out, "}");
-
-                    uint64_t h = 14695981039346656037ULL;
-                    h = fnv1a_update(h, &start_ms, sizeof(start_ms));
-                    h = fnv1a_update(h, &dur_sec, sizeof(dur_sec));
-                    h = fnv1a_update(h, &genre_lv1, sizeof(genre_lv1));
-                    h = fnv1a_update(h, pname, strlen(pname));
-                    h = fnv1a_update(h, pdesc, strlen(pdesc));
-
-                    if (new_hashes) {
-                        if (h_cnt >= h_cap) {
-                            size_t ncap = h_cap * 2;
-                            epg_hash_entry_t *nh = (epg_hash_entry_t *)realloc(new_hashes, ncap * sizeof(epg_hash_entry_t));
-                            if (nh) { new_hashes = nh; h_cap = ncap; }
-                        }
-                        if (h_cnt < h_cap) {
-                            new_hashes[h_cnt].id   = mir_pid;
-                            new_hashes[h_cnt].hash = h;
-                            h_cnt++;
-                        }
-                    }
-
-                    if (g_prev_hashes && out.buf && out.len > obj_pos) {
-                        epg_hash_entry_t key_entry = { mir_pid, 0 };
-                        epg_hash_entry_t *found = (epg_hash_entry_t *)bsearch(
-                            &key_entry, g_prev_hashes, g_prev_hash_cnt, sizeof(epg_hash_entry_t), cmp_hash_entry);
-                        if (!found) {
-                            push_epg_event("create", out.buf + obj_pos, out.len - obj_pos, now_ms);
-                            changed_count++;
-                        } else if (found->hash != h) {
-                            push_epg_event("update", out.buf + obj_pos, out.len - obj_pos, now_ms);
-                            changed_count++;
-                        }
-                    }
+                    eit_ingest_fallback((uint16_t)onid, (uint16_t)sid, (uint16_t)evid,
+                                        (int64_t)(start_ms / 1000), (uint32_t)dur_sec,
+                                        pname, pdesc, genre_lv1, genre_lv1 >= 0 ? genre_lv2 : -1);
                 }
             }
         }
@@ -683,158 +893,38 @@ static int fetch_and_build_epg_json(void) {
         if (!new_next[0]) break;
         snprintf(next_tok, sizeof(next_tok), "%s", new_next);
     }
-    sb_append(&out, "]");
-
-    if (new_hashes && h_cnt > 0) {
-        qsort(new_hashes, h_cnt, sizeof(epg_hash_entry_t), cmp_hash_entry);
-        /* 前回にあって今回消えた番組 ID を O(n) マージ走査で検出して remove イベント発行 */
-        if (g_prev_hashes && g_prev_hash_cnt > 0) {
-            size_t pi = 0, ni = 0;
-            int rem_cnt = 0;
-            while (pi < g_prev_hash_cnt && rem_cnt < 256) {
-                if (ni >= h_cnt || g_prev_hashes[pi].id < new_hashes[ni].id) {
-                    push_epg_remove_event(g_prev_hashes[pi].id, now_ms);
-                    changed_count++;
-                    rem_cnt++;
-                    pi++;
-                } else if (g_prev_hashes[pi].id == new_hashes[ni].id) {
-                    pi++;
-                    ni++;
-                } else {
-                    ni++;
-                }
-            }
-        }
-        free(g_prev_hashes);
-        g_prev_hashes   = new_hashes;
-        g_prev_hash_cnt = h_cnt;
-    } else {
-        free(new_hashes);
-    }
-
-    pthread_mutex_lock(&g_epg_mtx);
-    free(g_epg_cache_json);
-    g_epg_cache_json = out.buf;
-    g_epg_cache_ts = time(NULL);
-    pthread_mutex_unlock(&g_epg_mtx);
-    return changed_count;
+    g_epgdb_polled_once = 1;
 }
 
 int tv_db_poll_epg_changes(void) {
     pthread_mutex_lock(&g_fetch_mtx);
-    int chg = fetch_and_build_epg_json();
+    poll_webos_epgdb_locked();
+    int chg = sync_eit_events_locked();
     pthread_mutex_unlock(&g_fetch_mtx);
     return chg;
 }
 
-/**
- * キャッシュ済み EPG JSON 配列から条件に合う要素を抽出する。
- * target_id != 0 の場合は "id":target_id の単一オブジェクト（配列括弧なし）を返し、
- * filter_sid != 0 の場合は該当サービスの配列 "[...]" を返す。
- */
-static char *extract_epg_matching(const char *json, uint64_t filter_sid, uint64_t target_id) {
-    if (!json) return target_id ? NULL : strdup("[]");
-    strbuf_t sb;
-    if (target_id == 0) {
-        sb_init(&sb, 16384);
-        sb_append(&sb, "[");
-    } else {
-        memset(&sb, 0, sizeof(sb));
-    }
-
-    int count = 0;
-    const char *p = json;
-    while (*p && *p != '[') p++;
-    if (*p == '[') p++;
-
-    while (*p) {
-        p = skip_ws(p);
-        if (*p == ']' || *p == '\0') break;
-        if (*p == ',') { p++; continue; }
-        if (*p != '{') break;
-
-        /* 文字列リテラルを考慮してオブジェクト境界を探す */
-        const char *obj_start = p;
-        int depth = 0, in_str = 0, esc = 0;
-        while (*p) {
-            char c = *p++;
-            if (in_str) {
-                if (esc) esc = 0;
-                else if (c == '\\') esc = 1;
-                else if (c == '"') in_str = 0;
-            } else {
-                if (c == '"') in_str = 1;
-                else if (c == '{') depth++;
-                else if (c == '}') {
-                    depth--;
-                    if (depth == 0) break;
-                }
-            }
-        }
-        size_t obj_len = (size_t)(p - obj_start);
-
-        uint64_t id_val = 0, sid_val = 0, nid_val = 0;
-        if (sscanf(obj_start, "{\"id\":%llu,\"eventId\":%*u,\"serviceId\":%llu,\"networkId\":%llu,",
-                   (unsigned long long *)&id_val,
-                   (unsigned long long *)&sid_val,
-                   (unsigned long long *)&nid_val) == 3) {
-            if (target_id != 0) {
-                if (id_val == target_id) {
-                    char *res = (char *)malloc(obj_len + 1);
-                    if (res) {
-                        memcpy(res, obj_start, obj_len);
-                        res[obj_len] = '\0';
-                    }
-                    return res;
-                }
-            } else if (filter_sid != 0) {
-                uint64_t mir_sid = nid_val * 100000ULL + sid_val;
-                int hit = (filter_sid >= 100000ULL) ? (mir_sid == filter_sid) : (sid_val == filter_sid);
-                if (hit) {
-                    if (count > 0) sb_append(&sb, ",");
-                    sb_append_n(&sb, obj_start, obj_len);
-                    count++;
-                }
-            }
-        }
-    }
-
-    if (target_id != 0) return NULL;
-    sb_append(&sb, "]");
-    return sb.buf;
+int tv_db_sync_eit_events(void) {
+    pthread_mutex_lock(&g_fetch_mtx);
+    int chg = sync_eit_events_locked();
+    pthread_mutex_unlock(&g_fetch_mtx);
+    return chg;
 }
 
 char *tv_db_get_programs_json(uint64_t filter_sid, int force_refresh) {
-    pthread_mutex_lock(&g_epg_mtx);
-    int need_init = (!g_epg_cache_json);
-    pthread_mutex_unlock(&g_epg_mtx);
-
-    if (force_refresh || need_init) {
+    if (force_refresh || !g_epgdb_polled_once) {
         tv_db_poll_epg_changes();
     }
-
-    pthread_mutex_lock(&g_epg_mtx);
-    char *res;
-    if (filter_sid == 0) {
-        res = g_epg_cache_json ? strdup(g_epg_cache_json) : strdup("[]");
-    } else {
-        res = extract_epg_matching(g_epg_cache_json, filter_sid, 0);
-    }
-    pthread_mutex_unlock(&g_epg_mtx);
-    return res;
+    return eit_build_programs_json(filter_sid);
 }
 
 char *tv_db_get_program_by_id_json(uint64_t program_id) {
-    pthread_mutex_lock(&g_epg_mtx);
-    int need_init = (!g_epg_cache_json);
-    pthread_mutex_unlock(&g_epg_mtx);
-
-    if (need_init) {
+    if (!g_epgdb_polled_once) {
         tv_db_poll_epg_changes();
     }
+    return eit_build_program_json(program_id);
+}
 
-    pthread_mutex_lock(&g_epg_mtx);
-    char *res = extract_epg_matching(g_epg_cache_json, 0, program_id);
-    pthread_mutex_unlock(&g_epg_mtx);
-    return res;
+const char *tv_db_get_epg_raw_sample(void) {
+    return g_epg_raw_sample;
 }

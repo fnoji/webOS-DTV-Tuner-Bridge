@@ -23,7 +23,7 @@ chmod 644 "$APP_STAGE/native/libwebos_tuner.so" "$APP_STAGE/appinfo.json" "$APP_
 cat <<'EOF' > "$PKG_STAGE/packageinfo.json"
 {
   "id": "io.github.webostuner.app",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "app": "io.github.webostuner.app"
 }
 EOF
@@ -32,7 +32,7 @@ chmod 644 "$PKG_STAGE/packageinfo.json"
 SIZE=$(du -sb "$WORK_DIR/data" | awk '{print $1}')
 cat <<EOF > "$WORK_DIR/ctrl/control"
 Package: io.github.webostuner.app
-Version: 1.0.0
+Version: 1.1.0
 Section: misc
 Priority: optional
 Architecture: all
@@ -40,7 +40,7 @@ Installed-Size: $SIZE
 Maintainer: fnoji <https://github.com/fnoji>
 Description: webOS TV Dual-Tuner Bridge (BonDriver_WebOS / Mirakurun API)
 webOS-Package-Format-Version: 2
-webOS-Packager-Version: 1.0.0
+webOS-Packager-Version: 1.1.0
 EOF
 
 printf "2.0\n" > "$WORK_DIR/debian-binary"

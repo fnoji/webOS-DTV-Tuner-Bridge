@@ -14,13 +14,14 @@ typedef int (*b25_bcas_cb_t)(void *user, const uint8_t *tx, size_t tx_len, uint8
 typedef void (*b25_pid_cb_t)(void *user, uint16_t pid, int pid_type);
 
 #define B25_MAX_ECMS     16
-#define B25_MAX_SEC_ASM  32
+#define B25_MAX_SEC_ASM  64
 #define B25_MAX_SERVICES 32
-#define B25_MAX_SVC_ES   24
+#define B25_MAX_SVC_ES   64
 
 typedef struct {
     uint16_t pid;
     uint8_t  collecting;
+    uint8_t  last_cc;
     uint8_t  buf[4098];
     size_t   len;
     size_t   expected;
@@ -34,6 +35,7 @@ typedef struct {
     uint16_t es_pids[B25_MAX_SVC_ES];
     int      num_es;
     uint8_t  has_pmt;
+    uint8_t  pmt_ver;
 } b25_service_t;
 
 typedef struct {

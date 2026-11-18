@@ -6,6 +6,7 @@
  */
 #include "multi2.h"
 #include "tv_db.h"
+#include "eit.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -93,6 +94,10 @@ static pthread_mutex_t   g_cli_mtx = PTHREAD_MUTEX_INITIALIZER;
 static stream_client_t   g_clients[MAX_STREAM_CLIENTS];
 
 static volatile int      g_running = 1;
+static pthread_t         g_scan_th;
+static volatile int      g_scan_fd_open   = 0;
+static volatile int      g_tuning_clients = 0;
+static volatile uint64_t g_last_client_ms = 0;
 
 static char              g_so_path[256]  = "/tmp/libwebos_tuner.so";
 static char              g_inj_path[256] = "/tmp/webos_inject";
@@ -393,6 +398,25 @@ static int count_active_clients(void) {
     return count_active_clients_for(-1);
 }
 
+static int is_epg_scan_allowed(void) {
+    if (g_tuning_clients > 0) return 0;
+    if (count_active_clients() > 0) return 0;
+    uint64_t last = g_last_client_ms;
+    if (last > 0) {
+        uint64_t now = mono_ms();
+        if (now >= last && (now - last) < 45000ULL) return 0;
+    }
+    return 1;
+}
+
+static void stop_epg_scan_for_client(void) {
+    g_last_client_ms = mono_ms();
+    if (g_scan_fd_open) {
+        if (g_scan_th) pthread_kill(g_scan_th, SIGUSR1);
+        for (int w = 0; w < 50 && g_scan_fd_open; w++) usleep(10000);
+    }
+}
+
 static uint64_t total_bytes_sent(void) {
     return g_tuner[0].bytes_total + g_tuner[1].bytes_total;
 }
@@ -550,6 +574,9 @@ static void kick_clients_for_tuner(int tuner) {
 static int tune_tuner(int req_tuner, int media, uint32_t phy, uint32_t freq_khz, uint16_t tsid,
                       int force, int bypass_cache, int priority, int *tuner_out) {
     prune_dead_clients();
+    if (priority < 0 && (g_tuning_clients > 0 || count_active_clients() > 0)) {
+        return -2;
+    }
 
     int tv_lit = (strcmp(g_tv_power_state, "Active") == 0);
     int allow_t0 = (!tv_lit || priority >= 2);
@@ -591,6 +618,11 @@ static int tune_tuner(int req_tuner, int media, uint32_t phy, uint32_t freq_khz,
 
     tuner_state_t *t = &g_tuner[tid];
     pthread_mutex_lock(&t->tune_mtx);
+
+    if (priority < 0 && (g_tuning_clients > 0 || count_active_clients() > 0)) {
+        pthread_mutex_unlock(&t->tune_mtx);
+        return -2;
+    }
 
     int active_now = count_active_clients_for(tid);
     if (!bypass_cache && active_now > 0 && is_same_transponder(t, media, phy, freq_khz, tsid)) {
@@ -717,6 +749,10 @@ static void dispatch_ts_chunk(tuner_state_t *t, uint8_t *raw_buf, size_t *carry_
 
     size_t ts_bytes = pkts * 188u;
     t->bytes_total += ts_bytes;
+    g_last_client_ms = mono_ms();
+
+    /* 視聴中・EPGStation スキャン中も EIT セクションを受動収集する (Tuner 1 / Tuner 0 両対応) */
+    eit_feed_ts(ts_raw, pkts);
 
     int fds[MAX_STREAM_CLIENTS];
     int decs[MAX_STREAM_CLIENTS];
@@ -828,7 +864,9 @@ static void *ts_reader_thread(void *arg) {
                 dump_fd = -1;
                 carry = 0;
                 synced = 0;
+                g_last_client_ms = mono_ms();
                 add_log("[TS1] Reader closed (0 clients)");
+                tv_db_sync_eit_events();
             }
             t->reopen_req = 0;
             usleep(20000);
@@ -848,6 +886,10 @@ static void *ts_reader_thread(void *arg) {
         }
 
         if (dump_fd < 0) {
+            if (g_scan_fd_open) {
+                if (g_scan_th) pthread_kill(g_scan_th, SIGUSR1);
+                for (int w = 0; w < 30 && g_scan_fd_open; w++) usleep(10000);
+            }
             write_proc_str("/proc/lg/sdec/dump/buffer_size", "3145728");
             write_proc_str("/proc/lg/sdec/dump/input", "EXT_INPUT1");
             dump_fd = open("/proc/lg/sdec/dump/reader", O_RDONLY);
@@ -933,9 +975,11 @@ static void *pvr_reader_thread(void *arg) {
                 pvr_fd = -1;
                 carry = 0;
                 synced = 0;
+                g_last_client_ms = mono_ms();
                 char resp[128];
                 bridge_cmd("PVRSTOP", resp, sizeof(resp));
                 add_log("[TS0] PVR stopped (0 clients)");
+                tv_db_sync_eit_events();
             }
             t->reopen_req = 0;
             usleep(20000);
@@ -1150,7 +1194,10 @@ static void *tcp_client_worker(void *arg) {
             if (argc_n >= 4) {
                 int req_t = (argc_n >= 6) ? parse_tuner_arg(tstr, 1) : 1;
                 int actual_t = 1;
+                __sync_add_and_fetch(&g_tuning_clients, 1);
+                stop_epg_scan_for_client();
                 int tr = tune_tuner(req_t, media, phy, freq, (uint16_t)tsid, force, 0, 0, &actual_t);
+                __sync_sub_and_fetch(&g_tuning_clients, 1);
                 char resp[160];
                 int rl;
                 if (tr == 0) {
@@ -1256,6 +1303,9 @@ static void http_send_json(int fd, int code, const char *status, const char *bod
     char hdr[512];
     int hlen = snprintf(hdr, sizeof(hdr),
                         "HTTP/1.1 %d %s\r\n"
+                        /* Mirakurun / mirakc 互換クライアントは Server ヘッダーからバージョンを判定するため、
+                           実体が Mirakurun でなくても Mirakurun 互換であることを示すヘッダーを付与する */
+                        "Server: Mirakurun/3.9.0-webos-lite\r\n"
                         "Content-Type: application/json; charset=utf-8\r\n"
                         "Content-Length: %zu\r\n"
                         "Connection: close\r\n\r\n",
@@ -1348,16 +1398,22 @@ static int http_start_channel_stream(int fd, const tv_channel_t *ch, const char 
     const char *tq = query ? strstr(query, "tuner=") : NULL;
     if (tq) req_t = parse_tuner_arg(tq + 6, -1);
     int actual_t = 1;
+
+    __sync_add_and_fetch(&g_tuning_clients, 1);
+    stop_epg_scan_for_client();
     int tr = tune_tuner(req_t, ch->media, ch->phy, ch->freq_khz, ch->tsid, 0, 0, priority, &actual_t);
     if (tr == -2) {
+        __sync_sub_and_fetch(&g_tuning_clients, 1);
         http_send_json(fd, 503, "Service Unavailable", "{\"error\":\"tuner busy\"}");
         return 0;
     }
     if (tr != 0) {
+        __sync_sub_and_fetch(&g_tuning_clients, 1);
         http_send_json(fd, 500, "Tune Failed", "{\"error\":\"tune failed\"}");
         return 0;
     }
     if (add_stream_client(fd, decode, 1, actual_t, filter_sid, priority) >= 0) {
+        __sync_sub_and_fetch(&g_tuning_clients, 1);
         const char *hdr =
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: video/MP2T\r\n"
@@ -1366,6 +1422,7 @@ static int http_start_channel_stream(int fd, const tv_channel_t *ch, const char 
         send(fd, hdr, strlen(hdr), MSG_NOSIGNAL);
         return 1;
     }
+    __sync_sub_and_fetch(&g_tuning_clients, 1);
     http_send_json(fd, 503, "Too Many Clients", "{\"error\":\"max clients\"}");
     return 0;
 }
@@ -1789,6 +1846,16 @@ static void *http_client_worker(void *arg) {
         } else {
             http_send_json(fd, 404, "Not Found", "{\"error\":\"channel not found\"}");
         }
+    } else if (strcmp(path, "/api/epg/status") == 0) {
+        /* EIT 収集状況 (デバッグ・動作確認用) */
+        char eb[160];
+        snprintf(eb, sizeof(eb), "{\"programs\":%d,\"native\":%d,\"scanning\":%d}",
+                 eit_program_count(), eit_native_count(), count_active_clients() == 0 ? 1 : 0);
+        http_send_json(fd, 200, "OK", eb);
+    } else if (strcmp(path, "/api/debug/epg-raw") == 0) {
+        /* EPG DB (com.webos.epgdb) の生応答を返す。ジャンル (genreList) などの実フォーマット確認用 */
+        const char *raw = tv_db_get_epg_raw_sample();
+        http_send_json(fd, 200, "OK", raw ? raw : "{}");
     } else {
         http_send_json(fd, 404, "Not Found", "{\"error\":\"not found\"}");
     }
@@ -2252,6 +2319,170 @@ static void *epg_poller_thread(void *arg) {
     return NULL;
 }
 
+/**
+ * EIT 巡回スキャンスレッド
+ *
+ * LG 純正 EPG DB は「TV 本体が選局したトランスポンダ」分しか持たないため、
+ * クライアントが居ない時間帯に Tuner1 で各トランスポンダを順番に受信し、
+ * EIT[p/f] / EIT[schedule actual/other] を直接収集して番組表を構築する。
+ * (視聴中はスキャンを即座に中断し、次回は中断位置から再開する)
+ */
+static void *epg_scan_thread(void *arg) {
+    (void)arg;
+    const size_t RAW_CAP = 192u * 1024u;
+    const size_t TS_CAP  = 188u * 1024u;
+    uint8_t *raw = (uint8_t *)malloc(RAW_CAP);
+    uint8_t *ts  = (uint8_t *)malloc(TS_CAP);
+    if (!raw || !ts) { free(raw); free(ts); return NULL; }
+
+    /* 起動直後は TV 側の初期化が終わっていないことがあるため少し待つ */
+    for (int i = 0; i < 12 && g_running; i++) sleep(1);
+
+    int scan_cursor = 0;
+
+    while (g_running) {
+        if (!is_epg_scan_allowed()) {
+            sleep(2);
+            continue;
+        }
+
+        /* トランスポンダ (media, phy) の一覧を作る (GR全局 -> BS代表2波 -> CS代表4波 -> 残りBS/CS の順で初回収集を高速化) */
+        pthread_mutex_lock(&g_ch_mtx);
+        int n = g_chlist.count;
+        tv_channel_t *tps = (tv_channel_t *)malloc(sizeof(tv_channel_t) * (size_t)(n > 0 ? n : 1));
+        int tpn = 0;
+        if (tps) {
+            /* Pass 1: GR 全トランスポンダ */
+            for (int i = 0; i < n; i++) {
+                if (g_chlist.items[i].is_sub || g_chlist.items[i].media != 1) continue;
+                int dup = 0;
+                for (int j = 0; j < tpn; j++) {
+                    if (tps[j].media == g_chlist.items[i].media && tps[j].phy == g_chlist.items[i].phy) { dup = 1; break; }
+                }
+                if (!dup) tps[tpn++] = g_chlist.items[i];
+            }
+            /* Pass 2: BS 先頭 2 トランスポンダ (EIT[other] で BS 全 26 局の基本番組表を即収集) */
+            int bs_head = 0;
+            for (int i = 0; i < n && bs_head < 2; i++) {
+                if (g_chlist.items[i].is_sub || g_chlist.items[i].media != 4) continue;
+                int dup = 0;
+                for (int j = 0; j < tpn; j++) {
+                    if (tps[j].media == g_chlist.items[i].media && tps[j].phy == g_chlist.items[i].phy) { dup = 1; break; }
+                }
+                if (!dup) { tps[tpn++] = g_chlist.items[i]; bs_head++; }
+            }
+            /* Pass 3: CS 先頭 4 トランスポンダ (CS1/CS2 の EIT[other] で CS 全局の基本番組表を即収集) */
+            int cs_head = 0;
+            for (int i = 0; i < n && cs_head < 4; i++) {
+                if (g_chlist.items[i].is_sub || g_chlist.items[i].media != 5) continue;
+                int dup = 0;
+                for (int j = 0; j < tpn; j++) {
+                    if (tps[j].media == g_chlist.items[i].media && tps[j].phy == g_chlist.items[i].phy) { dup = 1; break; }
+                }
+                if (!dup) { tps[tpn++] = g_chlist.items[i]; cs_head++; }
+            }
+            /* Pass 4: 残りの全トランスポンダ (詳細記述子 extended の網羅収集用) */
+            for (int i = 0; i < n; i++) {
+                if (g_chlist.items[i].is_sub) continue;
+                int dup = 0;
+                for (int j = 0; j < tpn; j++) {
+                    if (tps[j].media == g_chlist.items[i].media && tps[j].phy == g_chlist.items[i].phy) { dup = 1; break; }
+                }
+                if (!dup) tps[tpn++] = g_chlist.items[i];
+            }
+        }
+        pthread_mutex_unlock(&g_ch_mtx);
+        if (!tps || tpn == 0) { free(tps); sleep(10); continue; }
+
+        if (scan_cursor >= tpn) scan_cursor = 0;
+
+        for (int step = 0; step < tpn && g_running; step++) {
+            if (!is_epg_scan_allowed()) break;
+
+            int k = scan_cursor % tpn;
+            eit_set_mux(tps[k].onid, tps[k].tsid);
+            int tr = tune_tuner(1, tps[k].media, tps[k].phy, tps[k].freq_khz, tps[k].tsid, 0, 1, -10, NULL);
+            if (tr != 0 && tr != -3) {
+                if (!is_epg_scan_allowed()) break;
+                scan_cursor = (k + 1) % tpn;
+                usleep(300 * 1000);
+                continue;
+            }
+            scan_cursor = (k + 1) % tpn;
+
+            if (!is_epg_scan_allowed()) break;
+
+            write_proc_str("/proc/lg/sdec/dump/buffer_size", "3145728");
+            write_proc_str("/proc/lg/sdec/dump/input", "EXT_INPUT1");
+            int fd = open("/proc/lg/sdec/dump/reader", O_RDONLY);
+            if (fd < 0) { usleep(300 * 1000); continue; }
+            g_scan_fd_open = 1;
+
+            size_t carry = 0;
+            unsigned long long scan_bytes = 0;
+            size_t scan_pkts = 0;
+            size_t eit_pkts = 0;
+            uint64_t until = mono_ms() + 12000; /* 1 トランスポンダあたり 12 秒 */
+            while (g_running && mono_ms() < until) {
+                if (!is_epg_scan_allowed()) break; /* 視聴や選局が始まったら即中断 */
+                ssize_t r = read(fd, raw + carry, RAW_CAP - carry);
+                if (r <= 0) {
+                    if (r < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
+                        if (!is_epg_scan_allowed()) break;
+                        usleep(10 * 1000);
+                        continue;
+                    }
+                    break;
+                }
+                scan_bytes += (unsigned long long)r;
+                size_t avail = carry + (size_t)r;
+                size_t pos = 0, npk = 0;
+                /* 192 バイト単位 (4 バイトヘッダ + 188 バイト TS) を 0x47 同期で切り出す */
+                while (pos + 192u * 4u <= avail && npk < TS_CAP / 188) {
+                    if (raw[pos] == 0x47 && raw[pos + 192] == 0x47 && raw[pos + 384] == 0x47) {
+                        memcpy(ts + npk * 188u, raw + pos, 188u);
+                        npk++;
+                        pos += 192u;
+                    } else {
+                        pos++;
+                    }
+                }
+                if (npk > 0) { eit_feed_ts(ts, npk); scan_pkts += npk; }
+                for (size_t pi = 0; pi < npk; pi++) {
+                    const uint8_t *pp = ts + pi * 188u;
+                    if (pp[0] != 0x47) continue;
+                    int pid = ((pp[1] & 0x1F) << 8) | pp[2];
+                    if (pid >= 0x12 && pid <= 0x26) eit_pkts++;
+                }
+                carry = avail - pos;
+                if (carry > 0) memmove(raw, raw + pos, carry);
+                if (carry > RAW_CAP - 4096u) carry = 0;
+            }
+            close(fd);
+            g_scan_fd_open = 0;
+
+            int chg = tv_db_sync_eit_events();
+            add_log("[EPG] scan %s phy=%u: %llu bytes / %u ts-pkts / %u eit-pkts / %d programs (+%d ev)",
+                    tps[k].type_str, tps[k].phy, scan_bytes, (unsigned)scan_pkts, (unsigned)eit_pkts, eit_native_count(), chg);
+
+            if (!is_epg_scan_allowed()) break;
+            usleep(200 * 1000);
+        }
+
+        free(tps);
+
+        /* 一巡したら少し休む (視聴が無いときだけ次周回へ) */
+        for (int i = 0; i < 30 && g_running; i++) {
+            if (!is_epg_scan_allowed()) break;
+            sleep(1);
+        }
+    }
+
+    free(raw);
+    free(ts);
+    return NULL;
+}
+
 int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--so") == 0 && i + 1 < argc)
@@ -2303,6 +2534,8 @@ int main(int argc, char **argv) {
         add_log("[WARN] B-CAS SystemKey load failed");
     }
 
+    eit_init();
+
     if (tv_db_load_channels(&g_chlist) == 0) {
         add_log("[INIT] Loaded %d channels from webOS DB8.", g_chlist.count);
     } else {
@@ -2318,6 +2551,7 @@ int main(int argc, char **argv) {
     pthread_create(&th_http, NULL, http_server_thread, NULL);
     pthread_create(&th_pwr,  NULL, power_standby_thread, NULL);
     pthread_create(&th_epg,  NULL, epg_poller_thread, NULL);
+    pthread_create(&g_scan_th, NULL, epg_scan_thread, NULL);
 
     while (g_running) {
         sleep(1);

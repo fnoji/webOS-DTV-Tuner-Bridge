@@ -12,8 +12,8 @@ libwebos_tuner.so: libwebos_tuner.c
 webos_inject: webos_inject.c
 	$(CC) $(CFLAGS) webos_inject.c -o $@ $(LDFLAGS_BIN)
 
-webos_tuner_d: webos_tuner_d.c tv_db.c multi2.c tv_db.h multi2.h
-	$(CC) $(CFLAGS) webos_tuner_d.c tv_db.c multi2.c -o $@ $(LDFLAGS_BIN)
+webos_tuner_d: webos_tuner_d.c tv_db.c multi2.c eit.c arib_text.c tv_db.h multi2.h eit.h arib_text.h arib_jis0208.h
+	$(CC) $(CFLAGS) webos_tuner_d.c tv_db.c multi2.c eit.c arib_text.c -o $@ $(LDFLAGS_BIN)
 
 clean:
 	rm -f libwebos_tuner.so webos_inject webos_tuner_d
