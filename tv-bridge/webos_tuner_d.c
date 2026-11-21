@@ -1298,18 +1298,84 @@ static void *tcp_server_thread(void *arg) {
 }
 
 /* ---- HTTP :40772 (Mirakurun 互換 API & ステータス画面) ---- */
+static __thread char t_http_origin[256];
+
+/* HTTP リクエストヘッダー部から指定ヘッダー値を安全に抽出する (CR/LF 除去) */
+static void parse_http_header_value(const char *req, const char *header_name, char *out, size_t out_sz) {
+    if (!out || out_sz == 0) return;
+    out[0] = '\0';
+    if (!req || !header_name) return;
+
+    const char *hdr_end = strstr(req, "\r\n\r\n");
+    size_t nlen = strlen(header_name);
+    const char *p = strchr(req, '\n');
+    while (p && (!hdr_end || p < hdr_end)) {
+        p++;
+        if (hdr_end && p >= hdr_end) break;
+        if (*p == '\r' || *p == '\n' || *p == '\0') break;
+        if (strncasecmp(p, header_name, nlen) == 0 && p[nlen] == ':') {
+            const char *v = p + nlen + 1;
+            while (*v == ' ' || *v == '\t') v++;
+            size_t i = 0;
+            while (*v && *v != '\r' && *v != '\n' && i + 1 < out_sz) {
+                unsigned char ch = (unsigned char)*v++;
+                if (ch >= 0x20 && ch != 0x7f) out[i++] = (char)ch;
+            }
+            while (i > 0 && (out[i - 1] == ' ' || out[i - 1] == '\t')) i--;
+            out[i] = '\0';
+            return;
+        }
+        p = strchr(p, '\n');
+    }
+}
+
+/* 本家 Mirakurun (cors) 準拠: Origin ヘッダーがある場合に Access-Control-Allow-Origin + Vary: Origin を返す */
+static void format_cors_headers(char *buf, size_t sz) {
+    if (!buf || sz == 0) return;
+    if (t_http_origin[0] != '\0') {
+        snprintf(buf, sz,
+                 "Access-Control-Allow-Origin: %s\r\n"
+                 "Vary: Origin\r\n",
+                 t_http_origin);
+    } else {
+        buf[0] = '\0';
+    }
+}
+
+static void http_send_cors_preflight(int fd, const char *req) {
+    char req_hdrs[256];
+    parse_http_header_value(req, "Access-Control-Request-Headers", req_hdrs, sizeof(req_hdrs));
+    const char *allow_origin = (t_http_origin[0] != '\0') ? t_http_origin : "*";
+    const char *allow_hdrs = (req_hdrs[0] != '\0') ? req_hdrs : "Content-Type, X-Mirakurun-Priority";
+    char hdr[1024];
+    int hlen = snprintf(hdr, sizeof(hdr),
+                        "HTTP/1.1 204 No Content\r\n"
+                        "Server: Mirakurun/3.9.0-webos-lite\r\n"
+                        "Access-Control-Allow-Origin: %s\r\n"
+                        "Vary: Origin, Access-Control-Request-Headers\r\n"
+                        "Access-Control-Allow-Methods: GET, HEAD, PUT, PATCH, POST, DELETE, OPTIONS\r\n"
+                        "Access-Control-Allow-Headers: %s\r\n"
+                        "Content-Length: 0\r\n"
+                        "Connection: close\r\n\r\n",
+                        allow_origin, allow_hdrs);
+    if (hlen > 0) send(fd, hdr, (size_t)hlen, MSG_NOSIGNAL);
+}
+
 static void http_send_json(int fd, int code, const char *status, const char *body) {
     size_t blen = body ? strlen(body) : 0;
-    char hdr[512];
+    char cors[320];
+    format_cors_headers(cors, sizeof(cors));
+    char hdr[896];
     int hlen = snprintf(hdr, sizeof(hdr),
                         "HTTP/1.1 %d %s\r\n"
                         /* Mirakurun / mirakc 互換クライアントは Server ヘッダーからバージョンを判定するため、
                            実体が Mirakurun でなくても Mirakurun 互換であることを示すヘッダーを付与する */
                         "Server: Mirakurun/3.9.0-webos-lite\r\n"
+                        "%s"
                         "Content-Type: application/json; charset=utf-8\r\n"
                         "Content-Length: %zu\r\n"
                         "Connection: close\r\n\r\n",
-                        code, status, blen);
+                        code, status, cors, blen);
     send(fd, hdr, (size_t)hlen, MSG_NOSIGNAL);
     if (blen > 0) send_all_timeout(fd, (const uint8_t *)body, blen);
 }
@@ -1414,12 +1480,18 @@ static int http_start_channel_stream(int fd, const tv_channel_t *ch, const char 
     }
     if (add_stream_client(fd, decode, 1, actual_t, filter_sid, priority) >= 0) {
         __sync_sub_and_fetch(&g_tuning_clients, 1);
-        const char *hdr =
+        char cors[320];
+        format_cors_headers(cors, sizeof(cors));
+        char hdr[640];
+        int hl = snprintf(hdr, sizeof(hdr),
             "HTTP/1.1 200 OK\r\n"
+            "Server: Mirakurun/3.9.0-webos-lite\r\n"
+            "%s"
             "Content-Type: video/MP2T\r\n"
             "Cache-Control: no-cache\r\n"
-            "Connection: close\r\n\r\n";
-        send(fd, hdr, strlen(hdr), MSG_NOSIGNAL);
+            "Connection: close\r\n\r\n",
+            cors);
+        if (hl > 0) send(fd, hdr, (size_t)hl, MSG_NOSIGNAL);
         return 1;
     }
     __sync_sub_and_fetch(&g_tuning_clients, 1);
@@ -1437,12 +1509,18 @@ static void http_handle_events_stream(int fd) {
     }
     uint64_t cursor = tv_db_get_event_seq();
     int already_sent = 0;
-    const char *hdr =
+    char cors[320];
+    format_cors_headers(cors, sizeof(cors));
+    char hdr[640];
+    int hl = snprintf(hdr, sizeof(hdr),
         "HTTP/1.1 200 OK\r\n"
+        "Server: Mirakurun/3.9.0-webos-lite\r\n"
+        "%s"
         "Content-Type: application/json; charset=utf-8\r\n"
         "Cache-Control: no-cache\r\n"
-        "Connection: close\r\n\r\n[";
-    if (send(fd, hdr, strlen(hdr), MSG_NOSIGNAL) <= 0) {
+        "Connection: close\r\n\r\n[",
+        cors);
+    if (hl <= 0 || send(fd, hdr, (size_t)hl, MSG_NOSIGNAL) <= 0) {
         __sync_sub_and_fetch(&g_event_streams, 1);
         return;
     }
@@ -1501,6 +1579,15 @@ static void *http_client_worker(void *arg) {
 
     char method[16] = {0}, raw_url[1024] = {0};
     if (sscanf(req, "%15s %1023s", method, raw_url) != 2) { close(fd); return NULL; }
+
+    /* リクエストの Origin をスレッドローカルへ保持し、Mirakurun 準拠の CORS ヘッダーを返す */
+    parse_http_header_value(req, "Origin", t_http_origin, sizeof(t_http_origin));
+
+    if (strcmp(method, "OPTIONS") == 0) {
+        http_send_cors_preflight(fd, req);
+        close(fd);
+        return NULL;
+    }
 
     char path[512] = {0}, query[512] = {0};
     char *qm = strchr(raw_url, '?');
@@ -1682,9 +1769,11 @@ static void *http_client_worker(void *arg) {
                 pos += snprintf(txt + pos, (size_t)(16384 - pos), "%s\n", g_log_ring[idx]);
             }
             pthread_mutex_unlock(&g_log_mtx);
-            char hdr[256];
+            char cors[320];
+            format_cors_headers(cors, sizeof(cors));
+            char hdr[640];
             int hl = snprintf(hdr, sizeof(hdr),
-                              "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: %d\r\nConnection: close\r\n\r\n", pos);
+                              "HTTP/1.1 200 OK\r\nServer: Mirakurun/3.9.0-webos-lite\r\n%sContent-Type: text/plain; charset=utf-8\r\nContent-Length: %d\r\nConnection: close\r\n\r\n", cors, pos);
             send(fd, hdr, (size_t)hl, MSG_NOSIGNAL);
             if (pos > 0) send_all_timeout(fd, (const uint8_t *)txt, (size_t)pos);
             free(txt);
