@@ -24,6 +24,8 @@ typedef struct {
     char     ch_num[16];
     char     name[128];
     char     sig_id[48];       /* "<TSID>_<SID>_<ONID>" (epgdb紐付用) */
+    char     logo_path[256];   /* TV内蔵受信済み ARIB 局ロゴ PNG パス (/mnt/lg/user/jlogo/...) */
+    uint8_t  has_logo;         /* 1=ロゴPNGあり, 0=なし */
     uint64_t mirakurun_sid;    /* (uint64_t)onid * 100000ULL + sid */
 } tv_channel_t;
 

@@ -1380,6 +1380,57 @@ static void http_send_json(int fd, int code, const char *status, const char *bod
     if (blen > 0) send_all_timeout(fd, (const uint8_t *)body, blen);
 }
 
+static void http_send_logo_file(int fd, const char *logo_path) {
+    if (!logo_path || !logo_path[0]) {
+        http_send_json(fd, 404, "Not Found", "{\"error\":\"logo not available\"}");
+        return;
+    }
+    FILE *fp = fopen(logo_path, "rb");
+    if (!fp) {
+        http_send_json(fd, 404, "Not Found", "{\"error\":\"logo not available\"}");
+        return;
+    }
+    if (fseek(fp, 0, SEEK_END) != 0) {
+        fclose(fp);
+        http_send_json(fd, 404, "Not Found", "{\"error\":\"logo not available\"}");
+        return;
+    }
+    long fsz = ftell(fp);
+    if (fsz <= 0 || fsz > 262144 || fseek(fp, 0, SEEK_SET) != 0) {
+        fclose(fp);
+        http_send_json(fd, 404, "Not Found", "{\"error\":\"logo not available\"}");
+        return;
+    }
+    uint8_t *buf = (uint8_t *)malloc((size_t)fsz);
+    if (!buf) {
+        fclose(fp);
+        http_send_json(fd, 500, "Internal Server Error", "{\"error\":\"out of memory\"}");
+        return;
+    }
+    size_t nread = fread(buf, 1, (size_t)fsz, fp);
+    fclose(fp);
+    if (nread == 0) {
+        free(buf);
+        http_send_json(fd, 404, "Not Found", "{\"error\":\"logo not available\"}");
+        return;
+    }
+    char cors[320];
+    format_cors_headers(cors, sizeof(cors));
+    char hdr[768];
+    int hl = snprintf(hdr, sizeof(hdr),
+                      "HTTP/1.1 200 OK\r\n"
+                      "Server: Mirakurun/3.9.0-webos-lite\r\n"
+                      "%s"
+                      "Content-Type: image/png\r\n"
+                      "Cache-Control: public, max-age=86400\r\n"
+                      "Content-Length: %zu\r\n"
+                      "Connection: close\r\n\r\n",
+                      cors, nread);
+    if (hl > 0) send(fd, hdr, (size_t)hl, MSG_NOSIGNAL);
+    send_all_timeout(fd, buf, nread);
+    free(buf);
+}
+
 /* DNS リバインディング対策: Host ヘッダ検証 */
 static int is_valid_host_header(const char *req) {
     const char *h = strstr(req, "\r\nHost: ");
@@ -1913,7 +1964,7 @@ static void *http_client_worker(void *arg) {
             http_send_json(fd, 200, "OK", pj ? pj : "[]");
             free(pj);
         } else if (endp && (strcmp(endp, "/logo") == 0 || strcmp(endp, "/logo/") == 0)) {
-            http_send_json(fd, 404, "Not Found", "{\"error\":\"logo not available\"}");
+            http_send_logo_file(fd, ch_copy.has_logo ? ch_copy.logo_path : NULL);
         } else if (!endp || *endp == '\0' || strcmp(endp, "/") == 0) {
             char *sj = tv_db_build_service_json_one(&ch_copy);
             http_send_json(fd, 200, "OK", sj ? sj : "{}");

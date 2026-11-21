@@ -247,6 +247,42 @@ static int is_dummy_channel_name(const char *name) {
     return 0;
 }
 
+/* TV 純正 DB のロゴパス (/mnt/user/jlogo/... または /mnt/lg/user/jlogo/...) の実在を確認して正規化する */
+static int check_logo_file_exists(const char *path) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return 0;
+    long sz = -1;
+    if (fseek(fp, 0, SEEK_END) == 0) sz = ftell(fp);
+    fclose(fp);
+    return (sz > 0 && sz <= 262144) ? 1 : 0;
+}
+
+static int resolve_tv_logo_path(const char *raw, char *out, size_t out_sz) {
+    if (!raw || !raw[0] || !out || out_sz == 0) return 0;
+    if (strstr(raw, "..") != NULL) return 0;
+    const char *rel = NULL;
+    if (strncmp(raw, "/mnt/lg/user/jlogo/", 19) == 0) {
+        rel = raw + 19;
+    } else if (strncmp(raw, "/mnt/user/jlogo/", 16) == 0) {
+        rel = raw + 16;
+    } else {
+        return 0;
+    }
+    if (!rel[0]) return 0;
+    char cand[256];
+    snprintf(cand, sizeof(cand), "/mnt/lg/user/jlogo/%s", rel);
+    if (check_logo_file_exists(cand)) {
+        snprintf(out, out_sz, "%s", cand);
+        return 1;
+    }
+    snprintf(cand, sizeof(cand), "/mnt/user/jlogo/%s", rel);
+    if (check_logo_file_exists(cand)) {
+        snprintf(out, out_sz, "%s", cand);
+        return 1;
+    }
+    return 0;
+}
+
 static int cmp_channel(const void *a, const void *b) {
     const tv_channel_t *ca = (const tv_channel_t *)a;
     const tv_channel_t *cb = (const tv_channel_t *)b;
@@ -296,6 +332,8 @@ int tv_db_load_channels(tv_channel_list_t *list) {
         int special_svc = 0;
         long long num_val = 0;
         char key[64];
+        char logo_large[256] = {0};
+        char logo_small[256] = {0};
 
         while (*rp) {
             rp = skip_ws(rp);
@@ -329,6 +367,10 @@ int tv_db_load_channels(tv_channel_list_t *list) {
                 rp = parse_json_str(rp, ch.name, sizeof(ch.name));
             } else if (strcmp(key, "signalChannelId") == 0 && *rp == '"') {
                 rp = parse_json_str(rp, ch.sig_id, sizeof(ch.sig_id));
+            } else if (strcmp(key, "logoPathLarge") == 0 && *rp == '"') {
+                rp = parse_json_str(rp, logo_large, sizeof(logo_large));
+            } else if (strcmp(key, "logoPathSmall") == 0 && *rp == '"') {
+                rp = parse_json_str(rp, logo_small, sizeof(logo_small));
             } else if (strcmp(key, "skipped") == 0) {
                 ch.skipped = (strncmp(rp, "true", 4) == 0) ? 1 : 0;
                 rp = skip_json_val(rp);
@@ -366,6 +408,10 @@ int tv_db_load_channels(tv_channel_list_t *list) {
             } else {
                 continue;
             }
+            if (resolve_tv_logo_path(logo_large, ch.logo_path, sizeof(ch.logo_path)) ||
+                resolve_tv_logo_path(logo_small, ch.logo_path, sizeof(ch.logo_path))) {
+                ch.has_logo = 1;
+            }
             ch.mirakurun_sid = (uint64_t)ch.onid * 100000ULL + (uint64_t)ch.sid;
             if (list->count >= cap) {
                 cap *= 2;
@@ -389,6 +435,21 @@ int tv_db_load_channels(tv_channel_list_t *list) {
             if (o->media == c->media && o->onid == c->onid && o->tsid == c->tsid) {
                 if (o->sid < min_sid) min_sid = o->sid;
                 if (rkey == 0 && o->remote_key > 0) rkey = o->remote_key;
+                if (!c->has_logo && o->has_logo) {
+                    snprintf(c->logo_path, sizeof(c->logo_path), "%s", o->logo_path);
+                    c->has_logo = 1;
+                }
+            }
+        }
+        if (!c->has_logo && c->media == 1 && c->onid >= 30000) {
+            /* 地デジのサブチャンネル等で TSID 違いの場合も同一 ONID の局ロゴを補完 */
+            for (int j = 0; j < list->count; j++) {
+                const tv_channel_t *o = &list->items[j];
+                if (o->media == 1 && o->onid == c->onid && o->has_logo) {
+                    snprintf(c->logo_path, sizeof(c->logo_path), "%s", o->logo_path);
+                    c->has_logo = 1;
+                    break;
+                }
             }
         }
         if (c->media == 1 && c->remote_key == 0 && rkey > 0) {
@@ -447,20 +508,21 @@ const tv_channel_t *tv_db_find_by_sid(const tv_channel_list_t *list, uint64_t mi
 
 static void sb_append_service_obj(strbuf_t *sb, const tv_channel_t *c) {
     char head[384];
+    const char *has_logo_str = c->has_logo ? "true" : "false";
     if (c->remote_key > 0) {
         snprintf(head, sizeof(head),
                  "{\"id\":%llu,\"serviceId\":%u,\"networkId\":%u,\"type\":%u,"
-                 "\"remoteControlKeyId\":%d,\"hasLogoData\":false,\"epgReady\":true,"
+                 "\"remoteControlKeyId\":%d,\"hasLogoData\":%s,\"epgReady\":true,"
                  "\"channel\":{\"type\":\"%s\",\"channel\":\"%u\"},\"name\":",
                  (unsigned long long)c->mirakurun_sid, c->sid, c->onid, c->service_type ? c->service_type : 1,
-                 c->remote_key, c->type_str, c->phy);
+                 c->remote_key, has_logo_str, c->type_str, c->phy);
     } else {
         snprintf(head, sizeof(head),
                  "{\"id\":%llu,\"serviceId\":%u,\"networkId\":%u,\"type\":%u,"
-                 "\"hasLogoData\":false,\"epgReady\":true,"
+                 "\"hasLogoData\":%s,\"epgReady\":true,"
                  "\"channel\":{\"type\":\"%s\",\"channel\":\"%u\"},\"name\":",
                  (unsigned long long)c->mirakurun_sid, c->sid, c->onid, c->service_type ? c->service_type : 1,
-                 c->type_str, c->phy);
+                 has_logo_str, c->type_str, c->phy);
     }
     sb_append(sb, head);
     sb_append_json_str(sb, c->name);
