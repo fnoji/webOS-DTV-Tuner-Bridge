@@ -98,6 +98,7 @@ static pthread_t         g_scan_th;
 static volatile int      g_scan_fd_open   = 0;
 static volatile int      g_tuning_clients = 0;
 static volatile uint64_t g_last_client_ms = 0;
+static volatile int      g_eit_sync_pending = 0;
 
 static char              g_so_path[256]  = "/tmp/libwebos_tuner.so";
 static char              g_inj_path[256] = "/tmp/webos_inject";
@@ -866,7 +867,8 @@ static void *ts_reader_thread(void *arg) {
                 synced = 0;
                 g_last_client_ms = mono_ms();
                 add_log("[TS1] Reader closed (0 clients)");
-                tv_db_sync_eit_events();
+                /* リーダースレッドで EPG 同期するとチャンネル切替がブロックされるため、バックグラウンドへ非同期委譲する */
+                __sync_lock_test_and_set(&g_eit_sync_pending, 1);
             }
             t->reopen_req = 0;
             usleep(20000);
@@ -979,7 +981,8 @@ static void *pvr_reader_thread(void *arg) {
                 char resp[128];
                 bridge_cmd("PVRSTOP", resp, sizeof(resp));
                 add_log("[TS0] PVR stopped (0 clients)");
-                tv_db_sync_eit_events();
+                /* リーダースレッドで EPG 同期するとチャンネル切替がブロックされるため、バックグラウンドへ非同期委譲する */
+                __sync_lock_test_and_set(&g_eit_sync_pending, 1);
             }
             t->reopen_req = 0;
             usleep(20000);
@@ -2454,7 +2457,18 @@ static void *epg_poller_thread(void *arg) {
         if (chg > 0) {
             add_log("[EPG] Poll detected %d program event(s)", chg);
         }
-        for (int i = 0; i < 300 && g_running; i++) sleep(1);
+        for (int i = 0; i < 300 && g_running; i++) {
+            sleep(1);
+            /* クライアント切断後に保留された EIT 差分同期を、視聴・選局が落ち着いたアイドル時だけ非同期実行する */
+            if (g_eit_sync_pending && count_active_clients() == 0 && g_tuning_clients == 0) {
+                uint64_t last = g_last_client_ms;
+                uint64_t now = mono_ms();
+                if (last == 0 || (now >= last && (now - last) >= 5000ULL)) {
+                    __sync_lock_release(&g_eit_sync_pending);
+                    tv_db_sync_eit_events();
+                }
+            }
+        }
     }
     return NULL;
 }

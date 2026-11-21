@@ -762,8 +762,17 @@ static int sync_eit_events_locked(void) {
             }
         }
         size_t obj_len = (size_t)(p - obj_start);
+        /* glibc sscanf() は毎回 strlen(obj_start) を走査するため、巨大 JSON 上では O(N^2) となる。
+           先頭 6 バイト比較 + strtoull() で O(1) 抽出する。 */
         unsigned long long mir_pid = 0;
-        if (sscanf(obj_start, "{\"id\":%llu,", &mir_pid) == 1 && mir_pid > 0) {
+        if (obj_len > 7 && strncmp(obj_start, "{\"id\":", 6) == 0) {
+            char *ep = NULL;
+            unsigned long long v = strtoull(obj_start + 6, &ep, 10);
+            if (ep && ep > obj_start + 6 && *ep == ',') {
+                mir_pid = v;
+            }
+        }
+        if (mir_pid > 0) {
             uint64_t h = fnv1a_update(14695981039346656037ULL, obj_start, obj_len);
             if (new_hashes) {
                 if (h_cnt >= h_cap) {
