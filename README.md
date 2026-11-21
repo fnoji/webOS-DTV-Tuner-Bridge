@@ -50,7 +50,7 @@ webOS 5.x 以降での動作確認はしておらず、BS4K は現状非対応�
   - TV 内アプリ (`webOS DTV Tuner`) および PC ブラウザ (`http://<TVのIP>:40772/`) から TV モデル/webOS バージョン・TV ネーム・IP アドレス・各チューナー稼働状態・ログを確認でき、ブラウザからは 3 秒ごとの自動更新・電源待機モード選択・TV 画面 ON/OFF 操作も行えます。
 - **セキュリティ堅牢化**
   - **DNS リバインディング対策**: HTTP リクエストの `Host` ヘッダを厳格に検証し、IP リテラル・自機ホスト名・`localhost` 以外の外部ドメイン経由のアクセスを `403 Forbidden` で即座に遮断します。
-  - **CSRF 対策**: TV の電源や待機モードを変更する `/api/power` は `POST` メソッドを必須化し、他サイトからの画像タグ (`<img src="...">`) 等を用いた意図しない電源操作を防ぎます。ただし TV 内アプリ / `tunerctl.sh` が使用する同一端末内 (`127.0.0.1`) からの操作は GET でも許可します。不要なワイルドカード CORS ヘッダ (`Access-Control-Allow-Origin: *`) も排除しています。
+  - **CSRF 対策 & Mirakurun 準拠 CORS**: TV の電源や待機モードを変更する `/api/power` は `POST` メソッドを必須化し、他サイトからの画像タグ (`<img src="...">`) 等を用いた意図しない電源操作を防ぎます。ただし TV 内アプリ / `tunerctl.sh` が使用する同一端末内 (`127.0.0.1`) からの操作は GET でも許可します。CORS は本家 Mirakurun 仕様に準拠し、ブラウザからの API 利用に必要な `Origin` 反射 (`Access-Control-Allow-Origin` + `Vary: Origin` / `OPTIONS` プリフライト) に対応しつつ、通常応答での無条件ワイルドカード (`*`) は使用していません。
 
 ---
 
@@ -144,7 +144,7 @@ release/
   - `完全シャットダウン`: TV OFF 時に OS を完全停止（Cold Off）します。WOL 復帰の可否は機種・ファームに依存し、復帰する場合も起動に約 20 秒かかります。
 - **Mirakurun 互換 API (`:40772`) および EPGStation 連携について**:
   - 本サーバーは Node.js 版の本家 Mirakurun ではなく、C 言語で実装された軽量互換サーバーです。本家 Mirakurun 側のアップデート管理とは独立しています。
-  - 対応エンドポイント: `/api/version`, `/api/status`, `/api/config/server`, `/api/events/stream`, `/api/power`, `/api/tuners`, `/api/tuners/:index`, `/api/channels`, `/api/services`, `/api/services/:id`, `/api/services/:id/programs`, `/api/services/:id/stream`, `/api/programs`, `/api/programs/:id`, `/api/programs/:id/stream`。
+  - 対応エンドポイント: `/api/version`, `/api/status`, `/api/config/server`, `/api/events/stream`, `/api/power`, `/api/tuners`, `/api/tuners/:index`, `/api/channels`, `/api/services`, `/api/services/:id`, `/api/services/:id/logo`, `/api/services/:id/programs`, `/api/services/:id/stream`, `/api/programs`, `/api/programs/:id`, `/api/programs/:id/stream`。
   - **サービス絞り込み配信**: `/api/services/:id/stream` および `/api/programs/:id/stream` は指定サービスの映像・音声・字幕・データ放送カルーセル (`0x0B`/`0x0C`/`0x0D`)・PCR・ECM・PMT と共通 PSI/SI のみへ PID を絞り込み、PAT を単一サービス構成へ書き換えて送信します（`/api/channels/:type/:ch/stream` および `BonDriver_WebOS` はフル TS 配信）。
   - **`X-Mirakurun-Priority` 優先度制御 & 送信タイムアウト耐性**: 両チューナー使用中であっても、`X-Mirakurun-Priority`（`-128..128`、既定 `0`）が既存クライアントより大きい場合（または `>= 128`）は低優先度クライアントを切断して録画等へチューナーを明け渡します。配信ソケットは `SO_SNDTIMEO=12秒` かつ連続 3 回タイムアウトまで許容し、タイムアウト時は 1 秒スキップして他クライアントへの巻き添えを防止します。
   - **番組表・変更通知**: 番組表データ (`/api/programs`) は放送波 TS の `EIT` (`PID 0x12〜0x26`) を自前で直接解析して構築し、アイドル時の自動巡回スキャン（GR → BS → CS、クライアント選局時は即中断・45 秒クールダウン）および視聴中/外部スキャン中の受動収集で更新します。新規 (`create`)・変更 (`update`)・削除 (`remove`) 差分は `/api/events/stream`（連結 JSON 形式）へ逐次配信します。
@@ -152,7 +152,7 @@ release/
     - チャンネル一覧 (`/api/services`・`/api/channels`) は TV 純正の LS2 DB (`com.palm.db` の `com.webos.service.tv.channel.dblist:1`) から読み出すため、TV 本体側でのチャンネルスキャンが必要です（未スキャン局や BS4K 等の非対応波は現れません）。
     - 番組表 (`/api/programs`) は起動直後や未受信局の暫定フォールバックとしてのみ TV 純正 EPG DB (`com.webos.epgdb` の `com.webos.service.tv.programSCH:4`) を併用し、放送波 `EIT` を受信できた局・番組はすべて放送波由来データで上書き・優先します。そのため TV 本体側で未選局の CS 局等も自動で番組表が揃い、サブチャンネルの共有イベント (`relatedItems` 等) も Mirakurun 準拠で制御されます。
     - `com.palm.db` / `com.webos.epgdb` の LS2 サービス名・DB スキーマは webOS のバージョンや機種で変更される場合があります。動作検証は webOS 4.4.3（55UK7500PJA）のみのため、他環境で一覧や番組表が取得できない場合は `/api/log` と `/api/status` を確認してください。
-  - **未対応**: 放送局ロゴ画像 (`/api/services/:id/logo`)。
+  - **放送局ロゴ画像 (`/api/services/:id/logo`)**: TV 純正 DB (`logoPathLarge` / `logoPathSmall`) に登録されている PNG ロゴファイルを配信し、ロゴが存在する局には `/api/services` で `hasLogoData: true` を返します（TV 側にロゴが無い一部局は `404` / `hasLogoData: false` となります）。
 - **対応機種の範囲**:
   - LG 55UK7500PJA (webOS 4.x / Rockhopper 4.4.3-22) 実機にて動作検証しています。webOS バージョンや SoC 世代によっては内部 HAL シンボルの差異により動作しない場合があります。
 
